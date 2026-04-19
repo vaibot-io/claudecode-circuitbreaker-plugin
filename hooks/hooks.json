@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$PLUGIN_DIR/scripts/pre-tool-use.mjs\"",
+            "command": "node \"$CLAUDE_PLUGIN_ROOT/scripts/pre-tool-use.mjs\"",
             "timeout": 15
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$PLUGIN_DIR/scripts/post-tool-use.mjs\"",
+            "command": "node \"$CLAUDE_PLUGIN_ROOT/scripts/post-tool-use.mjs\"",
             "timeout": 10
           }
         ]
