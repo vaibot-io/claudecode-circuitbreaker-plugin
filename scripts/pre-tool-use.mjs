@@ -163,6 +163,48 @@ function clearPendingApproval(tool, command, cwd) {
   try { unlinkSync(pendingPath(tool, command, cwd)) } catch { /* may not exist */ }
 }
 
+// ── Onboarding nudge (one-shot per session) ────────────────────────────────
+// On the first approval_required of a session, if the account is still on its
+// synthetic @bootstrap.vaibot.io email (claimed:false), nudge the user to
+// claim it via the MCP tool so they can approve from the dashboard.
+
+const NUDGED_DIR = join(STATE_DIR, 'nudged')
+
+function nudgeMarkerPath(sessionId) {
+  const safe = createHash('sha256').update(String(sessionId)).digest('hex').slice(0, 32)
+  return join(NUDGED_DIR, safe)
+}
+
+function alreadyNudged(sessionId) {
+  try { return existsSync(nudgeMarkerPath(sessionId)) } catch { return false }
+}
+
+function markNudged(sessionId) {
+  try {
+    mkdirSync(NUDGED_DIR, { recursive: true, mode: 0o700 })
+    writeFileSync(nudgeMarkerPath(sessionId), String(Date.now()), { mode: 0o600 })
+  } catch { /* best-effort */ }
+}
+
+async function maybeNudgeUnclaimed(sessionId) {
+  if (alreadyNudged(sessionId)) return
+  try {
+    const res = await fetch(`${API_URL}/v2/accounts/me`, {
+      headers: { authorization: `Bearer ${API_KEY}` },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    })
+    if (!res.ok) return
+    const data = await res.json()
+    if (data?.claimed === false) {
+      process.stderr.write(
+        `VAIBot: claim your account to approve from the dashboard.\n` +
+        `  Run via MCP:  vaibot_set_account_email { email: "you@example.com" }\n`
+      )
+      markNudged(sessionId)
+    }
+  } catch { /* best-effort */ }
+}
+
 async function bestEffortFinalize(runId, outcome, summary) {
   if (!runId) return
   try {
@@ -347,6 +389,9 @@ async function main() {
       if (contentHash) writePendingApproval(toolName, command, cwd, contentHash)
       // Finalize so the receipt reflects enforcement, not a dangling decide.
       await bestEffortFinalize(data.run_id, 'blocked', `Plugin enforced: approval_required`)
+      // One-shot onboarding nudge: if the account isn't claimed, they can't
+      // reach the dashboard to approve. Best-effort, never blocks.
+      await maybeNudgeUnclaimed(sessionId)
       const output = {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',

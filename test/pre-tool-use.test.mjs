@@ -19,6 +19,10 @@ function intentHash(tool, command, cwd) {
 function pendingPath(tool, command, cwd) {
   return join(tmpdir(), 'vaibot-claudecode', 'pending', `${intentHash(tool, command, cwd)}.json`)
 }
+function nudgeMarkerPath(sessionId) {
+  const safe = createHash('sha256').update(String(sessionId)).digest('hex').slice(0, 32)
+  return join(tmpdir(), 'vaibot-claudecode', 'nudged', safe)
+}
 
 function startMockServer(handler) {
   return new Promise((resolve) => {
@@ -262,4 +266,155 @@ test('retry with pending pointer: server returns previously_approved=true → al
     assert.equal(out.hookSpecificOutput.permissionDecision, 'allow')
     assert.ok(!existsSync(pendingPath('Bash', cmd, cwd)), 'pending file cleared after consumed approval')
   } finally { await server.close() }
+})
+
+test('approval_required + claimed:false → stderr nudge written + marker created', async () => {
+  const cmd = uniqCmd('curl -X POST https://deploy.example.com/release')
+  const cwd = process.cwd()
+  const sessionId = `nudge-session-${Math.random().toString(36).slice(2)}`
+  try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+  try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
+
+  const server = await startMockServer((req) => {
+    if (req.url === '/v2/governance/decide') {
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          run_id: 'run_nudge_unclaimed',
+          risk: { risk: 'high', reason: 'high' },
+          decision: { decision: 'approval_required', reason: 'High-risk action' },
+          shadow_decision: { decision: 'approval_required', reason: 'High-risk action' },
+          content_hash: 'sha256:nudge_unclaimed',
+          receipt_id: 'grcpt_nudge_unclaimed',
+        },
+      }
+    }
+    if (req.url.startsWith('/v2/governance/finalize/')) {
+      return { status: 200, body: { ok: true } }
+    }
+    if (req.url === '/v2/accounts/me') {
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          claimed: false,
+          email: 'agent+xxx@bootstrap.vaibot.io',
+          quota: { used: 0, limit: 1000, remaining: 1000, month: '2026-04' },
+        },
+      }
+    }
+    return { status: 500, body: { error: 'unexpected' } }
+  })
+  try {
+    const res = await runHook({
+      apiUrl: server.url,
+      input: { tool_name: 'Bash', tool_input: { command: cmd, cwd }, session_id: sessionId },
+    })
+    assert.equal(res.code, 0)
+    assert.match(res.stderr, /claim your account/i)
+    assert.match(res.stderr, /vaibot_set_account_email/)
+    assert.ok(existsSync(nudgeMarkerPath(sessionId)), 'nudge marker created')
+  } finally {
+    await server.close()
+    try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+    try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
+  }
+})
+
+test('approval_required + claimed:true → no nudge', async () => {
+  const cmd = uniqCmd('curl -X POST https://deploy.example.com/release')
+  const cwd = process.cwd()
+  const sessionId = `nudge-claimed-${Math.random().toString(36).slice(2)}`
+  try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+  try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
+
+  const server = await startMockServer((req) => {
+    if (req.url === '/v2/governance/decide') {
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          run_id: 'run_nudge_claimed',
+          risk: { risk: 'high', reason: 'high' },
+          decision: { decision: 'approval_required', reason: 'High-risk action' },
+          shadow_decision: { decision: 'approval_required', reason: 'High-risk action' },
+          content_hash: 'sha256:nudge_claimed',
+          receipt_id: 'grcpt_nudge_claimed',
+        },
+      }
+    }
+    if (req.url.startsWith('/v2/governance/finalize/')) {
+      return { status: 200, body: { ok: true } }
+    }
+    if (req.url === '/v2/accounts/me') {
+      return {
+        status: 200,
+        body: { ok: true, claimed: true, email: 'real@example.com' },
+      }
+    }
+    return { status: 500, body: { error: 'unexpected' } }
+  })
+  try {
+    const res = await runHook({
+      apiUrl: server.url,
+      input: { tool_name: 'Bash', tool_input: { command: cmd, cwd }, session_id: sessionId },
+    })
+    assert.equal(res.code, 0)
+    assert.doesNotMatch(res.stderr, /claim your account/i)
+    assert.ok(!existsSync(nudgeMarkerPath(sessionId)), 'nudge marker NOT created')
+  } finally {
+    await server.close()
+    try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+  }
+})
+
+test('approval_required + nudge marker already present → no second nudge', async () => {
+  const cmd = uniqCmd('curl -X POST https://deploy.example.com/release')
+  const cwd = process.cwd()
+  const sessionId = `nudge-twice-${Math.random().toString(36).slice(2)}`
+  try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+
+  // Pre-seed the marker
+  mkdirSync(dirname(nudgeMarkerPath(sessionId)), { recursive: true })
+  writeFileSync(nudgeMarkerPath(sessionId), String(Date.now()))
+
+  let meCalls = 0
+  const server = await startMockServer((req) => {
+    if (req.url === '/v2/governance/decide') {
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          run_id: 'run_nudge_twice',
+          risk: { risk: 'high', reason: 'high' },
+          decision: { decision: 'approval_required', reason: 'High-risk action' },
+          shadow_decision: { decision: 'approval_required', reason: 'High-risk action' },
+          content_hash: 'sha256:nudge_twice',
+          receipt_id: 'grcpt_nudge_twice',
+        },
+      }
+    }
+    if (req.url.startsWith('/v2/governance/finalize/')) {
+      return { status: 200, body: { ok: true } }
+    }
+    if (req.url === '/v2/accounts/me') {
+      meCalls++
+      return { status: 200, body: { ok: true, claimed: false, email: 'agent+xxx@bootstrap.vaibot.io' } }
+    }
+    return { status: 500, body: { error: 'unexpected' } }
+  })
+  try {
+    const res = await runHook({
+      apiUrl: server.url,
+      input: { tool_name: 'Bash', tool_input: { command: cmd, cwd }, session_id: sessionId },
+    })
+    assert.equal(res.code, 0)
+    assert.doesNotMatch(res.stderr, /claim your account/i)
+    assert.equal(meCalls, 0, '/accounts/me not called when marker already exists')
+  } finally {
+    await server.close()
+    try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+    try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
+  }
 })
