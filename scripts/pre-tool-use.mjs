@@ -243,30 +243,35 @@ async function main() {
 
     const data = await res.json()
 
+    // Prefer shadow_decision (raw policy verdict) over decision (post-server-
+    // observe-mode). Falls back to decision for older API responses.
+    const rawDecision = data.shadow_decision?.decision ?? data.decision?.decision
+    const rawReason = data.shadow_decision?.reason ?? data.decision?.reason
+
     // Save run state for post-tool-use finalization
     saveRunState(toolCallId, {
       run_id: data.run_id,
       content_hash: data.content_hash,
       receipt_id: data.receipt_id,
-      decision: data.decision?.decision,
+      decision: rawDecision,
       risk: data.risk?.risk,
       tool_name: toolName,
       tool_call_id: toolCallId,
       ts: Date.now(),
     })
 
-    // In observe mode, always allow but log
+    // In observe mode, always allow but log the raw policy verdict
     if (MODE === 'observe') {
-      if (data.decision?.decision !== 'allow') {
+      if (rawDecision && rawDecision !== 'allow') {
         process.stderr.write(
-          `VAIBot [observe]: ${toolName} would be ${data.decision?.decision} — ${data.decision?.reason}\n`
+          `VAIBot [observe]: ${toolName} would be ${rawDecision} — ${rawReason}\n`
         )
       }
       process.exit(0)
     }
 
-    // Enforce mode — act on the decision
-    const decision = data.decision?.decision
+    // Enforce mode — act on the raw decision (not server's observe-coerced one)
+    const decision = rawDecision
 
     if (decision === 'allow') {
       const output = {
@@ -280,7 +285,7 @@ async function main() {
     }
 
     if (decision === 'approval_required') {
-      const reason = data.decision?.reason ?? `Approval required for ${toolName}`
+      const reason = rawReason ?? `Approval required for ${toolName}`
       const contentHash = data.content_hash ?? ''
       const output = {
         hookSpecificOutput: {
@@ -297,7 +302,7 @@ async function main() {
     }
 
     if (decision === 'deny') {
-      const reason = data.decision?.reason ?? `Denied by policy for ${toolName}`
+      const reason = rawReason ?? `Denied by policy for ${toolName}`
       const output = {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
