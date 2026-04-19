@@ -337,6 +337,12 @@ async function main() {
 
     const data = await res.json()
 
+    // Session-start onboarding nudge — fires once per session on the first
+    // tool call (regardless of decision outcome). The marker under STATE_DIR
+    // guarantees idempotency across retries. Safe-users who never hit
+    // approval_required still see it exactly once early in their flow.
+    await maybeNudgeUnclaimed(sessionId)
+
     // Prefer shadow_decision (raw policy verdict) over decision (post-server-
     // observe-mode). Falls back to decision for older API responses.
     const rawDecision = data.shadow_decision?.decision ?? data.decision?.decision
@@ -389,9 +395,6 @@ async function main() {
       if (contentHash) writePendingApproval(toolName, command, cwd, contentHash)
       // Finalize so the receipt reflects enforcement, not a dangling decide.
       await bestEffortFinalize(data.run_id, 'blocked', `Plugin enforced: approval_required`)
-      // One-shot onboarding nudge: if the account isn't claimed, they can't
-      // reach the dashboard to approve. Best-effort, never blocks.
-      await maybeNudgeUnclaimed(sessionId)
       const output = {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',

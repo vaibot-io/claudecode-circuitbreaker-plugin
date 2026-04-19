@@ -268,6 +268,56 @@ test('retry with pending pointer: server returns previously_approved=true → al
   } finally { await server.close() }
 })
 
+test('allow + claimed:false → stderr nudge fires on first tool call of session (session-start behavior)', async () => {
+  const cmd = uniqCmd('echo hi')
+  const cwd = process.cwd()
+  const sessionId = `nudge-allow-${Math.random().toString(36).slice(2)}`
+  try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
+
+  const server = await startMockServer((req) => {
+    if (req.url === '/v2/governance/decide') {
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          run_id: 'run_allow_nudge',
+          risk: { risk: 'low', reason: 'safe' },
+          decision: { decision: 'allow', reason: 'low risk' },
+          shadow_decision: { decision: 'allow', reason: 'low risk' },
+          content_hash: 'sha256:allow_nudge',
+          receipt_id: 'grcpt_allow_nudge',
+        },
+      }
+    }
+    if (req.url === '/v2/accounts/me') {
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          claimed: false,
+          email: 'agent+xxx@bootstrap.vaibot.io',
+          quota: { used: 0, limit: 1000, remaining: 1000, month: '2026-04' },
+        },
+      }
+    }
+    return { status: 500, body: { error: 'unexpected' } }
+  })
+  try {
+    const res = await runHook({
+      apiUrl: server.url,
+      input: { tool_name: 'Bash', tool_input: { command: cmd, cwd }, session_id: sessionId },
+    })
+    assert.equal(res.code, 0)
+    const out = JSON.parse(res.stdout)
+    assert.equal(out.hookSpecificOutput.permissionDecision, 'allow', 'decision is still allow')
+    assert.match(res.stderr, /claim your account/i, 'nudge fires even on allow')
+    assert.ok(existsSync(nudgeMarkerPath(sessionId)), 'marker created')
+  } finally {
+    await server.close()
+    try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
+  }
+})
+
 test('approval_required + claimed:false → stderr nudge written + marker created', async () => {
   const cmd = uniqCmd('curl -X POST https://deploy.example.com/release')
   const cwd = process.cwd()
