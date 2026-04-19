@@ -1,0 +1,329 @@
+#!/usr/bin/env node
+/**
+ * VAIBot Claude Code PreToolUse hook.
+ *
+ * Reads tool call details from stdin (JSON), calls the VAIBot governance API,
+ * and outputs a permission decision to stdout.
+ *
+ * On first run with no API key, auto-bootstraps a free-tier account by calling
+ * POST /v2/bootstrap with a machine fingerprint. Credentials are saved to
+ * ~/.vaibot/credentials.json for subsequent runs.
+ *
+ * Environment variables:
+ *   VAIBOT_API_URL    — base URL of the VAIBot v2 API (default: https://api.vaibot.io)
+ *   VAIBOT_API_KEY    — Bearer token for the governance API (auto-provisioned if missing)
+ *   VAIBOT_MODE       — "observe" (default) or "enforce"
+ *   VAIBOT_TIMEOUT_MS — request timeout in ms (default: 10000)
+ *
+ * Exit codes:
+ *   0 — allow (or observe mode)
+ *   2 — deny (reason written to stderr)
+ */
+
+import { createHash } from 'node:crypto'
+import { writeFileSync, readFileSync, mkdirSync, existsSync } from 'node:fs'
+import { tmpdir, hostname, userInfo } from 'node:os'
+import { join } from 'node:path'
+import { homedir } from 'node:os'
+
+// ── Credentials file ───────────────────────────────────────────────────────
+
+const CREDS_DIR = join(homedir(), '.vaibot')
+const CREDS_FILE = join(CREDS_DIR, 'credentials.json')
+
+function loadSavedCredentials() {
+  try {
+    if (existsSync(CREDS_FILE)) {
+      return JSON.parse(readFileSync(CREDS_FILE, 'utf-8'))
+    }
+  } catch { /* ignore corrupt file */ }
+  return null
+}
+
+function saveCredentials(creds) {
+  try {
+    mkdirSync(CREDS_DIR, { recursive: true, mode: 0o700 })
+    writeFileSync(CREDS_FILE, JSON.stringify(creds, null, 2), { mode: 0o600 })
+  } catch { /* best-effort */ }
+}
+
+// ── Config ──────────────────────────────────────────────────────────────────
+
+const API_URL = (process.env.VAIBOT_API_URL ?? 'https://api.vaibot.io').replace(/\/+$/, '')
+const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
+const AGENT_MODEL = 'claude-code'
+const FAIL_OPEN = process.env.VAIBOT_FAIL_OPEN === 'true'
+
+// API key: env var > saved credentials
+const savedCreds = loadSavedCredentials()
+let API_KEY = process.env.VAIBOT_API_KEY ?? savedCreds?.api_key ?? ''
+const MODE = process.env.VAIBOT_MODE ?? 'observe'
+
+// ── Fingerprint ────────────────────────────────────────────────────────────
+// Forensic correlation signal — NOT machine attestation.
+// Used for bootstrap idempotency and abuse pattern detection.
+
+function getFingerprint() {
+  const user = userInfo().username
+  const host = hostname()
+  const cwd = process.cwd()
+  return createHash('sha256').update(`${user}@${host}:${cwd}`).digest('hex')
+}
+
+// ── Auto-bootstrap ─────────────────────────────────────────────────────────
+
+async function bootstrap() {
+  const fingerprint = getFingerprint()
+
+  const res = await fetch(`${API_URL}/v2/bootstrap`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ fingerprint, agent: 'claude-code' }),
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  })
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`Bootstrap failed (${res.status}): ${text.slice(0, 200)}`)
+  }
+
+  const data = await res.json()
+
+  if (data.api_key) {
+    // New account — wallet address is the canonical identity
+    saveCredentials({
+      api_key: data.api_key,
+      account_id: data.account_id,
+      user_id: data.user_id,
+      wallet_address: data.wallet_address,
+      wallet_network: data.wallet_network,
+      api_url: API_URL,
+      bootstrapped_at: new Date().toISOString(),
+    })
+    process.stderr.write(
+      `VAIBot: account provisioned. Credentials saved to ${CREDS_FILE}\n` +
+      (data.wallet_address ? `VAIBot: identity ${data.wallet_address} on ${data.wallet_network}\n` : '')
+    )
+    return data.api_key
+  }
+
+  if (data.bootstrapped === false) {
+    // Already provisioned but we lost the key — tell the user
+    process.stderr.write(
+      `VAIBot: account exists but API key not found locally.\n` +
+      `  Check ${CREDS_FILE} or set VAIBOT_API_KEY manually.\n`
+    )
+    return null
+  }
+
+  return null
+}
+
+// ── State file for run tracking ─────────────────────────────────────────────
+
+const STATE_DIR = join(tmpdir(), 'vaibot-claudecode')
+
+function saveRunState(toolCallId, state) {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true })
+    writeFileSync(join(STATE_DIR, `${toolCallId}.json`), JSON.stringify(state))
+  } catch { /* best-effort */ }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+function clamp(str, max = 2000) {
+  if (typeof str !== 'string') return str
+  return str.length > max ? str.slice(0, max) + '…' : str
+}
+
+function extractCommand(toolName, input) {
+  if (!input) return undefined
+  if (toolName === 'Bash') return clamp(input.command)
+  if (toolName === 'Edit') return clamp(`Edit ${input.file_path}`)
+  if (toolName === 'Write') return clamp(`Write ${input.file_path}`)
+  if (toolName === 'Read') return clamp(`Read ${input.file_path}`)
+  if (toolName === 'Grep') return clamp(`Grep ${input.pattern}`)
+  if (toolName === 'Glob') return clamp(`Glob ${input.pattern}`)
+  if (toolName === 'WebFetch') return clamp(input.url)
+  if (toolName === 'Agent') return clamp(input.prompt?.slice(0, 500))
+  return undefined
+}
+
+function extractTarget(toolName, input) {
+  if (!input) return undefined
+  if (input.file_path) return input.file_path
+  if (input.url) return input.url
+  if (input.path) return input.path
+  return undefined
+}
+
+function extractCwd(toolName, input) {
+  if (!input) return undefined
+  if (input.cwd) return input.cwd
+  return process.cwd()
+}
+
+function stableHash(obj) {
+  const json = JSON.stringify(obj, Object.keys(obj).sort())
+  return createHash('sha256').update(json).digest('hex').slice(0, 16)
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
+
+async function main() {
+  // Read hook input from stdin
+  let raw = ''
+  for await (const chunk of process.stdin) raw += chunk
+
+  let hookInput
+  try {
+    hookInput = JSON.parse(raw)
+  } catch {
+    // Can't parse input — fail open to avoid blocking Claude Code
+    process.exit(0)
+  }
+
+  const toolName = hookInput.tool_name ?? hookInput.toolName ?? 'unknown'
+  const toolInput = hookInput.tool_input ?? hookInput.toolInput ?? {}
+  const sessionId = hookInput.session_id ?? hookInput.sessionId ?? `cc-${Date.now()}`
+
+  // Skip governance for the governance tools themselves (avoid recursion)
+  if (toolName.startsWith('mcp__vaibot')) {
+    process.exit(0)
+  }
+
+  // No API key — try auto-bootstrap
+  if (!API_KEY) {
+    try {
+      const bootstrapKey = await bootstrap()
+      if (bootstrapKey) {
+        API_KEY = bootstrapKey
+      } else {
+        // Bootstrap returned no key (already provisioned but lost) — fail open
+        process.exit(0)
+      }
+    } catch (err) {
+      process.stderr.write(`VAIBot [bootstrap]: ${err.message}\n`)
+      process.exit(0) // fail open on bootstrap failure
+    }
+  }
+
+  const command = extractCommand(toolName, toolInput)
+  const target = extractTarget(toolName, toolInput)
+  const cwd = extractCwd(toolName, toolInput)
+  const toolCallId = stableHash({ toolName, ...toolInput, ts: Date.now() })
+
+  const body = {
+    session_id: sessionId,
+    agent_id: 'claude-code',
+    agent_model: AGENT_MODEL,
+    tool: toolName,
+    workspace_dir: process.cwd(),
+    intent: { command, target, cwd },
+  }
+
+  try {
+    const res = await fetch(`${API_URL}/v2/governance/decide`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${API_KEY}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    })
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      if (FAIL_OPEN || MODE === 'observe') process.exit(0)
+      process.stderr.write(`VAIBot: governance API returned ${res.status}: ${text.slice(0, 200)}\n`)
+      process.exit(2)
+    }
+
+    const data = await res.json()
+
+    // Save run state for post-tool-use finalization
+    saveRunState(toolCallId, {
+      run_id: data.run_id,
+      content_hash: data.content_hash,
+      receipt_id: data.receipt_id,
+      decision: data.decision?.decision,
+      risk: data.risk?.risk,
+      tool_name: toolName,
+      tool_call_id: toolCallId,
+      ts: Date.now(),
+    })
+
+    // In observe mode, always allow but log
+    if (MODE === 'observe') {
+      if (data.decision?.decision !== 'allow') {
+        process.stderr.write(
+          `VAIBot [observe]: ${toolName} would be ${data.decision?.decision} — ${data.decision?.reason}\n`
+        )
+      }
+      process.exit(0)
+    }
+
+    // Enforce mode — act on the decision
+    const decision = data.decision?.decision
+
+    if (decision === 'allow') {
+      const output = {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'allow',
+        }
+      }
+      process.stdout.write(JSON.stringify(output))
+      process.exit(0)
+    }
+
+    if (decision === 'approval_required') {
+      const reason = data.decision?.reason ?? `Approval required for ${toolName}`
+      const contentHash = data.content_hash ?? ''
+      const output = {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            `${reason}\n` +
+            `content_hash: ${contentHash}\n` +
+            `Approve in the VAIBot dashboard or via API.`,
+        }
+      }
+      process.stdout.write(JSON.stringify(output))
+      process.exit(0)
+    }
+
+    if (decision === 'deny') {
+      const reason = data.decision?.reason ?? `Denied by policy for ${toolName}`
+      const output = {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: reason,
+        }
+      }
+      process.stdout.write(JSON.stringify(output))
+      process.exit(0)
+    }
+
+    // Unknown decision — fail open
+    process.exit(0)
+
+  } catch (err) {
+    // Network error, timeout, etc.
+    if (FAIL_OPEN || MODE === 'observe') {
+      process.stderr.write(`VAIBot [error]: ${err.message}\n`)
+      process.exit(0)
+    }
+    process.stderr.write(`VAIBot: governance API unreachable — ${err.message}\n`)
+    process.exit(2)
+  }
+}
+
+main().catch((err) => {
+  process.stderr.write(`VAIBot: unexpected error — ${err.message}\n`)
+  process.exit(FAIL_OPEN ? 0 : 2)
+})
