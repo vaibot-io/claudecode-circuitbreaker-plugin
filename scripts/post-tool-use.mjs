@@ -11,12 +11,28 @@
  *   VAIBOT_TIMEOUT_MS — request timeout in ms (default: 10000)
  */
 
-import { readFileSync, readdirSync, unlinkSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+// Credentials file — shared with pre-tool-use.mjs. The pre-hook's auto-bootstrap
+// writes the account's api_key here on first run; the post-hook must read the
+// same file to finalize receipts the pre-hook created. Reading env takes
+// precedence so an explicit VAIBOT_API_KEY always wins.
+const CREDS_FILE = join(homedir(), '.vaibot', 'credentials.json')
+
+function loadSavedCredentials() {
+  try {
+    if (existsSync(CREDS_FILE)) {
+      return JSON.parse(readFileSync(CREDS_FILE, 'utf-8'))
+    }
+  } catch { /* ignore corrupt file */ }
+  return null
+}
+
 const API_URL = (process.env.VAIBOT_API_URL ?? 'https://api.vaibot.io').replace(/\/+$/, '')
-const API_KEY = process.env.VAIBOT_API_KEY ?? ''
+const savedCreds = loadSavedCredentials()
+const API_KEY = process.env.VAIBOT_API_KEY ?? savedCreds?.api_key ?? ''
 const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
 
 const STATE_DIR = join(tmpdir(), 'vaibot-claudecode')
@@ -69,8 +85,6 @@ async function main() {
     process.exit(0)
   }
 
-  if (!API_KEY) process.exit(0)
-
   const toolName = hookInput.tool_name ?? hookInput.toolName ?? 'unknown'
   const error = hookInput.tool_error ?? hookInput.error ?? null
   const durationMs = hookInput.duration_ms ?? hookInput.durationMs ?? null
@@ -80,6 +94,16 @@ async function main() {
 
   const runState = findRunState(toolName)
   if (!runState?.run_id) process.exit(0)
+
+  // Receipt exists and needs closing — having no API key here is a real problem,
+  // not a silent skip. Warn so the user sees the receipt will be left open.
+  if (!API_KEY) {
+    process.stderr.write(
+      `VAIBot [finalize]: no API key — receipt ${runState.run_id} left unfinalized. ` +
+      `Set VAIBOT_API_KEY or ensure ${CREDS_FILE} is readable.\n`
+    )
+    process.exit(0)
+  }
 
   const outcome = error ? 'blocked' : 'allowed'
 
