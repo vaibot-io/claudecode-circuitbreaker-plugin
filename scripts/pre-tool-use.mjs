@@ -21,7 +21,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { writeFileSync, readFileSync, mkdirSync, existsSync } from 'node:fs'
+import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs'
 import { tmpdir, hostname, userInfo } from 'node:os'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -122,12 +122,57 @@ async function bootstrap() {
 // ── State file for run tracking ─────────────────────────────────────────────
 
 const STATE_DIR = join(tmpdir(), 'vaibot-claudecode')
+const PENDING_DIR = join(STATE_DIR, 'pending')
 
 function saveRunState(toolCallId, state) {
   try {
     mkdirSync(STATE_DIR, { recursive: true })
     writeFileSync(join(STATE_DIR, `${toolCallId}.json`), JSON.stringify(state))
   } catch { /* best-effort */ }
+}
+
+// ── Pending-approval state (retry awareness) ────────────────────────────────
+// Untrusted hint only. The server re-verifies intent (tool + command + cwd)
+// against the referenced approved receipt before honoring a short-circuit, so
+// a tampered file here cannot redirect an approval onto a different intent.
+
+function intentHash(tool, command, cwd) {
+  return createHash('sha256').update(`${tool}|${command ?? ''}|${cwd ?? ''}`).digest('hex').slice(0, 32)
+}
+
+function pendingPath(tool, command, cwd) {
+  return join(PENDING_DIR, `${intentHash(tool, command, cwd)}.json`)
+}
+
+function readPendingApproval(tool, command, cwd) {
+  try {
+    const p = pendingPath(tool, command, cwd)
+    if (!existsSync(p)) return null
+    return JSON.parse(readFileSync(p, 'utf-8'))
+  } catch { return null }
+}
+
+function writePendingApproval(tool, command, cwd, contentHash) {
+  try {
+    mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
+    writeFileSync(pendingPath(tool, command, cwd), JSON.stringify({ content_hash: contentHash, ts: Date.now() }), { mode: 0o600 })
+  } catch { /* best-effort */ }
+}
+
+function clearPendingApproval(tool, command, cwd) {
+  try { unlinkSync(pendingPath(tool, command, cwd)) } catch { /* may not exist */ }
+}
+
+async function bestEffortFinalize(runId, outcome, summary) {
+  if (!runId) return
+  try {
+    await fetch(`${API_URL}/v2/governance/finalize/${encodeURIComponent(runId)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${API_KEY}` },
+      body: JSON.stringify({ outcome, result: { summary } }),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    })
+  } catch { /* non-blocking */ }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -223,6 +268,13 @@ async function main() {
     intent: { command, target, cwd },
   }
 
+  // Retry awareness: if we previously got approval_required for this exact
+  // intent and saved a pointer, send it. Server re-verifies intent.
+  const pending = readPendingApproval(toolName, command, cwd)
+  if (pending?.content_hash) {
+    body.approved_content_hash = pending.content_hash
+  }
+
   try {
     const res = await fetch(`${API_URL}/v2/governance/decide`, {
       method: 'POST',
@@ -270,10 +322,14 @@ async function main() {
       process.exit(0)
     }
 
-    // Enforce mode — act on the raw decision (not server's observe-coerced one)
-    const decision = rawDecision
+    // Enforce mode — act on the raw decision (not server's observe-coerced one).
+    // If the server short-circuited via previously_approved, the effective
+    // decision is allow regardless of the policy verdict.
+    const decision = data.previously_approved ? 'allow' : rawDecision
 
     if (decision === 'allow') {
+      // Approval was consumed (or never needed) — clear pending state.
+      clearPendingApproval(toolName, command, cwd)
       const output = {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
@@ -287,6 +343,10 @@ async function main() {
     if (decision === 'approval_required') {
       const reason = rawReason ?? `Approval required for ${toolName}`
       const contentHash = data.content_hash ?? ''
+      // Save pointer so the next retry of this exact intent can short-circuit.
+      if (contentHash) writePendingApproval(toolName, command, cwd, contentHash)
+      // Finalize so the receipt reflects enforcement, not a dangling decide.
+      await bestEffortFinalize(data.run_id, 'blocked', `Plugin enforced: approval_required`)
       const output = {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
@@ -303,6 +363,9 @@ async function main() {
 
     if (decision === 'deny') {
       const reason = rawReason ?? `Denied by policy for ${toolName}`
+      // Hard-deny means even prior approval is irrelevant for this intent.
+      clearPendingApproval(toolName, command, cwd)
+      await bestEffortFinalize(data.run_id, 'blocked', `Plugin enforced: deny`)
       const output = {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
