@@ -18,7 +18,7 @@ When the user runs `/vaibot <subcommand>`, use the appropriate MCP tool:
 - `status` → call `mcp__vaibot-mcp-staging__vaibot_status` (or production equivalent)
 - `pending` → call `mcp__vaibot-mcp-staging__vaibot_pending`
 - `approve` → call `mcp__vaibot-mcp-staging__vaibot_approve` with the content_hash
-- `deny` → call the deny endpoint via the REST API
+- `deny` → call `mcp__vaibot-mcp-staging__vaibot_deny` with the content_hash
 - `recent` → call `mcp__vaibot-mcp-staging__vaibot_recent`
 - `policy` → call `mcp__vaibot-mcp-staging__vaibot_policy`
 
