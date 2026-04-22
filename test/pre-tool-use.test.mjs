@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
-import { mkdtempSync, existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -105,51 +105,69 @@ test('enforce + allow → permissionDecision: allow, no finalize call', async ()
   } finally { await server.close() }
 })
 
-test('enforce + approval_required → deny, finalize POSTed with outcome=blocked, pending file written', async () => {
-  const cmd = uniqCmd('curl -X POST https://deploy.example.com/release')
-  const cwd = process.cwd()
-  // Pre-clear any leftover pending file
-  try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+// Minimal decide-only handler for clarity in the ask tests below.
+function decideHandler(decisionBody) {
+  return (req) => req.url === '/v2/governance/decide'
+    ? { status: 200, body: { ok: true, ...decisionBody } }
+    : { status: 200, body: { ok: true } }
+}
 
-  const server = await startMockServer((req) => {
-    if (req.url === '/v2/governance/decide') {
-      return {
-        status: 200,
-        body: {
-          ok: true,
-          run_id: 'run_appr',
-          risk: { risk: 'high', reason: 'curl deploy' },
-          decision: { decision: 'approval_required', reason: 'High-risk action' },
-          shadow_decision: { decision: 'approval_required', reason: 'High-risk action' },
-          content_hash: 'sha256:appr',
-          receipt_id: 'grcpt_appr',
-        },
-      }
-    }
-    if (req.url.startsWith('/v2/governance/finalize/')) {
-      return { status: 200, body: { ok: true } }
-    }
-    return { status: 500, body: { error: 'unexpected' } }
-  })
+function stateFilePath(toolUseId) {
+  return join(tmpdir(), 'vaibot-claudecode', `${toolUseId}.json`)
+}
+
+test('approval_required → native ask (not deny)', async () => {
+  const server = await startMockServer(decideHandler({
+    decision: { decision: 'approval_required', reason: 'High-risk' },
+    shadow_decision: { decision: 'approval_required', reason: 'High-risk' },
+    content_hash: 'sha256:a', run_id: 'run_a', risk: { risk: 'high' },
+  }))
   try {
-    const res = await runHook({
-      apiUrl: server.url,
-      input: { tool_name: 'Bash', tool_input: { command: cmd, cwd }, session_id: 's' },
-    })
-    assert.equal(res.code, 0)
-    const out = JSON.parse(res.stdout)
-    assert.equal(out.hookSpecificOutput.permissionDecision, 'deny')
-    const finalizeCalls = server.requests.filter((r) => r.url.startsWith('/v2/governance/finalize/'))
-    assert.equal(finalizeCalls.length, 1, 'one finalize on approval_required')
-    assert.equal(finalizeCalls[0].body.outcome, 'blocked')
-
-    const pp = pendingPath('Bash', cmd, cwd)
-    assert.ok(existsSync(pp), 'pending file written')
-    const pending = JSON.parse(readFileSync(pp, 'utf-8'))
-    assert.equal(pending.content_hash, 'sha256:appr')
+    const res = await runHook({ apiUrl: server.url, input: {
+      tool_name: 'Bash', tool_input: { command: uniqCmd('curl x') },
+      session_id: 's', tool_use_id: 'tu_ask1',
+    }})
+    assert.equal(JSON.parse(res.stdout).hookSpecificOutput.permissionDecision, 'ask')
   } finally {
     await server.close()
-    try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+    try { rmSync(stateFilePath('tu_ask1')) } catch {}
+  }
+})
+
+test('approval_required → no finalize POSTed (receipt stays pending server-side)', async () => {
+  const server = await startMockServer(decideHandler({
+    decision: { decision: 'approval_required' }, shadow_decision: { decision: 'approval_required' },
+    content_hash: 'sha256:b', run_id: 'run_b',
+  }))
+  try {
+    await runHook({ apiUrl: server.url, input: {
+      tool_name: 'Bash', tool_input: { command: uniqCmd('curl y') },
+      session_id: 's', tool_use_id: 'tu_ask2',
+    }})
+    const finalizes = server.requests.filter((r) => r.url.startsWith('/v2/governance/finalize/'))
+    assert.equal(finalizes.length, 0)
+  } finally {
+    await server.close()
+    try { rmSync(stateFilePath('tu_ask2')) } catch {}
+  }
+})
+
+test('approval_required → runState carries approval_required=true + content_hash', async () => {
+  const server = await startMockServer(decideHandler({
+    decision: { decision: 'approval_required' }, shadow_decision: { decision: 'approval_required' },
+    content_hash: 'sha256:c', run_id: 'run_c',
+  }))
+  try {
+    await runHook({ apiUrl: server.url, input: {
+      tool_name: 'Bash', tool_input: { command: uniqCmd('curl z') },
+      session_id: 's', tool_use_id: 'tu_ask3',
+    }})
+    const state = JSON.parse(readFileSync(stateFilePath('tu_ask3'), 'utf-8'))
+    assert.equal(state.approval_required, true)
+    assert.equal(state.content_hash, 'sha256:c')
+  } finally {
+    await server.close()
+    try { rmSync(stateFilePath('tu_ask3')) } catch {}
   }
 })
 
@@ -228,6 +246,40 @@ test('finalize network error does not block deny output', async () => {
     const out = JSON.parse(res.stdout)
     assert.equal(out.hookSpecificOutput.permissionDecision, 'deny')
   } finally { await server.close() }
+})
+
+// Seed a stale ask-in-flight runState as if a prior PreToolUse emitted `ask`
+// and the user picked "No, tell Claude" (PostToolUse never fired to consume it).
+function seedStaleAsk(contentHash, toolUseId = 'tu_old') {
+  const stateDir = join(tmpdir(), 'vaibot-claudecode')
+  mkdirSync(stateDir, { recursive: true })
+  const path = join(stateDir, `${toolUseId}.json`)
+  writeFileSync(path, JSON.stringify({
+    tool_name: 'Bash', tool_use_id: toolUseId,
+    content_hash: contentHash, approval_required: true, ts: Date.now(),
+  }))
+  return path
+}
+
+test('sweep: stale approval_required runState → PATCH /deny on next PreToolUse', async () => {
+  const stalePath = seedStaleAsk('sha256:stale')
+  const server = await startMockServer(decideHandler({
+    decision: { decision: 'allow' }, shadow_decision: { decision: 'allow' },
+    content_hash: 'sha256:next', run_id: 'run_next',
+  }))
+  try {
+    await runHook({ apiUrl: server.url, input: {
+      tool_name: 'Bash', tool_input: { command: uniqCmd('echo hi') },
+      session_id: 's', tool_use_id: 'tu_new',
+    }})
+    const denies = server.requests.filter((r) => r.method === 'PATCH' && r.url.endsWith('/deny'))
+    assert.equal(denies.length, 1)
+    assert.ok(denies[0].url.includes('sha256%3Astale'))
+    assert.ok(!existsSync(stalePath))
+  } finally {
+    await server.close()
+    try { rmSync(stalePath) } catch {}
+  }
 })
 
 test('retry with pending pointer: server returns previously_approved=true → allow + clears pending', async () => {
