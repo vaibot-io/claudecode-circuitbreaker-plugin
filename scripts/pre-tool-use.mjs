@@ -50,6 +50,7 @@ function saveCredentials(creds) {
 // ── Config ──────────────────────────────────────────────────────────────────
 
 const API_URL = (process.env.VAIBOT_API_URL ?? 'https://api.vaibot.io').replace(/\/+$/, '')
+const DASHBOARD_URL = (process.env.VAIBOT_DASHBOARD_URL ?? 'https://www.vaibot.io').replace(/\/+$/, '')
 const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
 const AGENT_MODEL = 'claude-code'
 const FAIL_OPEN = process.env.VAIBOT_FAIL_OPEN === 'true'
@@ -100,9 +101,12 @@ async function bootstrap() {
       api_url: API_URL,
       bootstrapped_at: new Date().toISOString(),
     })
+    const claimUrl = `${DASHBOARD_URL}/claim?api_key=${encodeURIComponent(data.api_key)}`
     process.stderr.write(
       `VAIBot: account provisioned. Credentials saved to ${CREDS_FILE}\n` +
-      (data.wallet_address ? `VAIBot: identity ${data.wallet_address} on ${data.wallet_network}\n` : '')
+      (data.wallet_address ? `VAIBot: identity ${data.wallet_address} on ${data.wallet_network}\n` : '') +
+      `VAIBot: claim this account to approve from the dashboard:\n` +
+      `        ${claimUrl}\n`
     )
     return data.api_key
   }
@@ -240,9 +244,10 @@ async function maybeNudgeUnclaimed(sessionId) {
     if (!res.ok) return
     const data = await res.json()
     if (data?.claimed === false) {
+      const claimUrl = `${DASHBOARD_URL}/claim?api_key=${encodeURIComponent(API_KEY)}`
       process.stderr.write(
         `VAIBot: claim your account to approve from the dashboard.\n` +
-        `  Run via MCP:  vaibot_set_account_email { email: "you@example.com" }\n`
+        `        ${claimUrl}\n`
       )
       markNudged(sessionId)
     }
@@ -367,6 +372,15 @@ async function main() {
     body.approved_content_hash = pending.content_hash
   }
 
+  if (process.env.VAIBOT_DEBUG === '1') {
+    const ih = intentHash(toolName, command, cwd)
+    const pp = pendingPath(toolName, command, cwd)
+    process.stderr.write(
+      `VAIBot [debug] pre: tool=${toolName} cwd=${cwd} cmd=${(command ?? '').slice(0, 80)}\n` +
+      `VAIBot [debug] pre: intentHash=${ih} pendingFile=${pp} pendingExists=${existsSync(pp)} sentApproved=${pending?.content_hash ?? 'none'}\n`
+    )
+  }
+
   try {
     const res = await fetch(`${API_URL}/v2/governance/decide`, {
       method: 'POST',
@@ -386,6 +400,14 @@ async function main() {
     }
 
     const data = await res.json()
+
+    if (process.env.VAIBOT_DEBUG === '1') {
+      process.stderr.write(
+        `VAIBot [debug] post: shadow=${data.shadow_decision?.decision} effective=${data.decision?.decision} ` +
+        `prevApproved=${data.previously_approved ?? false} prevDenied=${data.previously_denied ?? false} ` +
+        `content_hash=${data.content_hash}\n`
+      )
+    }
 
     // Session-start onboarding nudge — fires once per session on the first
     // tool call (regardless of decision outcome). The marker under STATE_DIR

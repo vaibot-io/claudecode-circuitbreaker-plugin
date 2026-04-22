@@ -415,7 +415,7 @@ test('approval_required + claimed:false → stderr nudge written + marker create
     })
     assert.equal(res.code, 0)
     assert.match(res.stderr, /claim your account/i)
-    assert.match(res.stderr, /vaibot_set_account_email/)
+    assert.match(res.stderr, /\/claim\?api_key=/)
     assert.ok(existsSync(nudgeMarkerPath(sessionId)), 'nudge marker created')
   } finally {
     await server.close()
