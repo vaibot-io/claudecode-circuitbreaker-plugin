@@ -134,13 +134,13 @@ async function main() {
 
   const outcome = error ? 'blocked' : 'allowed'
 
-  const body = {
-    outcome,
-    result: {
-      duration_ms: durationMs,
-      error: error ? String(error).slice(0, 2000) : undefined,
-    },
-  }
+  // Only include optional result fields when we actually have values. Claude
+  // Code's PostToolUse hook input doesn't provide a duration for Bash calls,
+  // so `durationMs` is often null — omit the key entirely in that case.
+  const result = {}
+  if (typeof durationMs === 'number') result.duration_ms = durationMs
+  if (error) result.error = String(error).slice(0, 2000)
+  const body = { outcome, ...(Object.keys(result).length > 0 ? { result } : {}) }
 
   try {
     await fetch(`${API_URL}/v2/governance/finalize/${encodeURIComponent(runState.run_id)}`, {
