@@ -21,7 +21,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs'
+import { writeFileSync, readFileSync, readdirSync, mkdirSync, existsSync, unlinkSync } from 'node:fs'
 import { tmpdir, hostname, userInfo } from 'node:os'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -129,6 +129,50 @@ function saveRunState(toolCallId, state) {
     mkdirSync(STATE_DIR, { recursive: true })
     writeFileSync(join(STATE_DIR, `${toolCallId}.json`), JSON.stringify(state))
   } catch { /* best-effort */ }
+}
+
+// ── Ask-in-flight sweep ────────────────────────────────────────────────────
+// When PreToolUse emitted `permissionDecision: 'ask'`, the runState carries
+// `approval_required: true`. If the user clicks "Yes", PostToolUse fires and
+// consumes the entry (calling PATCH /approve). If the user clicks "No, tell
+// Claude", PostToolUse never fires — the entry remains until the next hook
+// (PreToolUse of a later call, Stop, or SubagentStop) sweeps it and calls
+// PATCH /deny.
+//
+// Race note: claim the entry by unlinking it BEFORE issuing the network call.
+// Whichever process wins the unlink owns the resolution; the loser (e.g. a
+// PostToolUse running in parallel) sees ENOENT and bails out. This keeps the
+// receipt event chain coherent even if hook processes overlap.
+
+async function sweepPendingApprovals({ excludeToolUseId } = {}) {
+  let files
+  try {
+    files = readdirSync(STATE_DIR).filter((f) => f.endsWith('.json'))
+  } catch { return }
+
+  for (const file of files) {
+    const path = join(STATE_DIR, file)
+    let entry
+    try { entry = JSON.parse(readFileSync(path, 'utf-8')) } catch { continue }
+
+    if (!entry?.approval_required) continue
+    if (excludeToolUseId && entry.tool_use_id === excludeToolUseId) continue
+    if (!entry.content_hash) { try { unlinkSync(path) } catch {} ; continue }
+
+    try { unlinkSync(path) } catch { continue }  // lost the race — another hook is handling it
+
+    try {
+      await fetch(`${API_URL}/v2/receipts/${encodeURIComponent(entry.content_hash)}/deny`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${API_KEY}` },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      })
+    } catch { /* best-effort */ }
+
+    if (entry.intent_key) {
+      try { unlinkSync(join(PENDING_DIR, `${entry.intent_key}.json`)) } catch {}
+    }
+  }
 }
 
 // ── Pending-approval state (retry awareness) ────────────────────────────────
@@ -274,6 +318,7 @@ async function main() {
   const toolName = hookInput.tool_name ?? hookInput.toolName ?? 'unknown'
   const toolInput = hookInput.tool_input ?? hookInput.toolInput ?? {}
   const sessionId = hookInput.session_id ?? hookInput.sessionId ?? `cc-${Date.now()}`
+  const toolUseId = hookInput.tool_use_id ?? hookInput.toolUseId ?? null
 
   // Skip governance for the governance tools themselves (avoid recursion)
   if (toolName.startsWith('mcp__vaibot')) {
@@ -296,10 +341,15 @@ async function main() {
     }
   }
 
+  // Resolve any still-pending ask-in-flight from a prior tool call. If the user
+  // clicked "No, tell Claude" on a previous `ask`, no PostToolUse fired — so
+  // this sweep is the first place the denial gets recorded server-side.
+  await sweepPendingApprovals({ excludeToolUseId: toolUseId })
+
   const command = extractCommand(toolName, toolInput)
   const target = extractTarget(toolName, toolInput)
   const cwd = extractCwd(toolName, toolInput)
-  const toolCallId = stableHash({ toolName, ...toolInput, ts: Date.now() })
+  const toolCallId = toolUseId ?? stableHash({ toolName, ...toolInput, ts: Date.now() })
 
   const body = {
     session_id: sessionId,
@@ -357,6 +407,9 @@ async function main() {
       risk: data.risk?.risk,
       tool_name: toolName,
       tool_call_id: toolCallId,
+      tool_use_id: toolUseId,
+      approval_required: rawDecision === 'approval_required' && !data.previously_approved,
+      intent_key: intentHash(toolName, command, cwd),
       ts: Date.now(),
     })
 
@@ -391,18 +444,23 @@ async function main() {
     if (decision === 'approval_required') {
       const reason = rawReason ?? `Approval required for ${toolName}`
       const contentHash = data.content_hash ?? ''
-      // Save pointer so the next retry of this exact intent can short-circuit.
+      const riskLabel = data.risk?.risk ?? 'elevated'
+      // Save pointer so a retry of this exact intent can short-circuit if the
+      // user later approves from the dashboard instead of the native UI.
       if (contentHash) writePendingApproval(toolName, command, cwd, contentHash)
-      // Finalize so the receipt reflects enforcement, not a dangling decide.
-      await bestEffortFinalize(data.run_id, 'blocked', `Plugin enforced: approval_required`)
+      // Route through Claude Code's native ask UI. The receipt stays in
+      // `pending` state server-side: if the user picks Yes, PostToolUse will
+      // PATCH /approve; if No, the next hook will sweep + PATCH /deny.
+      // No finalize here — that would close the receipt prematurely and the
+      // subsequent approve/deny PATCHes would return 404.
       const output = {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
-          permissionDecision: 'deny',
+          permissionDecision: 'ask',
           permissionDecisionReason:
-            `${reason}\n` +
+            `VAIBot flagged this ${toolName} call as ${riskLabel} risk — ${reason}\n` +
             `content_hash: ${contentHash}\n` +
-            `Approve in the VAIBot dashboard or via API.`,
+            `Approving here will record your decision in the VAIBot audit chain.`,
         }
       }
       process.stdout.write(JSON.stringify(output))

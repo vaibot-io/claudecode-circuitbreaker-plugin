@@ -38,7 +38,7 @@ const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
 const STATE_DIR = join(tmpdir(), 'vaibot-claudecode')
 const MAX_STATE_AGE_MS = 5 * 60 * 1000 // 5 minutes
 
-function findRunState(toolName) {
+function findRunState(toolName, toolUseId) {
   try {
     const files = readdirSync(STATE_DIR).filter(f => f.endsWith('.json'))
     const now = Date.now()
@@ -49,13 +49,19 @@ function findRunState(toolName) {
       try {
         const data = JSON.parse(readFileSync(join(STATE_DIR, file), 'utf-8'))
 
-        // Clean up expired state files
-        if (now - data.ts > MAX_STATE_AGE_MS) {
+        // Expire ordinary entries after 5min. Ask-in-flight entries live until
+        // a hook sweeps them (PostToolUse here, or PreToolUse/Stop sweep) —
+        // human decisions can outlast the normal expiry window.
+        if (!data.approval_required && now - data.ts > MAX_STATE_AGE_MS) {
           try { unlinkSync(join(STATE_DIR, file)) } catch { /* ignore */ }
           continue
         }
 
-        // Match by tool name, take the most recent
+        // Prefer exact tool_use_id match; fall back to most-recent tool_name.
+        if (toolUseId && data.tool_use_id === toolUseId) {
+          bestMatch = { ...data, file }
+          break
+        }
         if (data.tool_name === toolName && data.ts > bestTs) {
           bestMatch = { ...data, file }
           bestTs = data.ts
@@ -63,9 +69,12 @@ function findRunState(toolName) {
       } catch { /* ignore corrupt files */ }
     }
 
-    // Clean up the matched state file
+    // Claim the matched state file before any network call. If a parallel
+    // sweep beats us to the unlink, abandon the match so we don't double-
+    // resolve the same receipt.
     if (bestMatch) {
-      try { unlinkSync(join(STATE_DIR, bestMatch.file)) } catch { /* ignore */ }
+      try { unlinkSync(join(STATE_DIR, bestMatch.file)) }
+      catch { return null }
     }
 
     return bestMatch
@@ -86,13 +95,14 @@ async function main() {
   }
 
   const toolName = hookInput.tool_name ?? hookInput.toolName ?? 'unknown'
+  const toolUseId = hookInput.tool_use_id ?? hookInput.toolUseId ?? null
   const error = hookInput.tool_error ?? hookInput.error ?? null
   const durationMs = hookInput.duration_ms ?? hookInput.durationMs ?? null
 
   // Skip governance tools
   if (toolName.startsWith('mcp__vaibot')) process.exit(0)
 
-  const runState = findRunState(toolName)
+  const runState = findRunState(toolName, toolUseId)
   if (!runState?.run_id) process.exit(0)
 
   // Receipt exists and needs closing — having no API key here is a real problem,
@@ -103,6 +113,23 @@ async function main() {
       `Set VAIBOT_API_KEY or ensure ${CREDS_FILE} is readable.\n`
     )
     process.exit(0)
+  }
+
+  // PostToolUse firing after a `permissionDecision: 'ask'` means the user
+  // picked Yes in the native UI. Record the approval on the receipt chain
+  // before the normal finalize — without this the receipt's approval_status
+  // would stay `pending` forever even though execution proceeded.
+  if (runState.approval_required && runState.content_hash) {
+    try {
+      await fetch(`${API_URL}/v2/receipts/${encodeURIComponent(runState.content_hash)}/approve`, {
+        method: 'PATCH',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${API_KEY}`,
+        },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      })
+    } catch { /* best-effort — don't block finalize */ }
   }
 
   const outcome = error ? 'blocked' : 'allowed'
