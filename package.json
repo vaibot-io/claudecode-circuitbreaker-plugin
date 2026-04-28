@@ -1,8 +1,17 @@
 {
   "name": "@vaibot/claudecode-circuitbreaker-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "MIT",
   "type": "module",
+  "files": [
+    ".claude-plugin/",
+    ".mcp.json",
+    "hooks/",
+    "scripts/",
+    "skills/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "test": "node --test test/*.test.mjs"
   }

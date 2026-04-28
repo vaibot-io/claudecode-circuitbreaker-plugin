@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "vaibot-governance": {
+      "type": "http",
+      "url": "https://api.vaibot.io/v2/mcp"
+    }
+  }
+}
