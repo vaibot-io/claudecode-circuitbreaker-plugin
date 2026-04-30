@@ -138,6 +138,18 @@ Claude Code                    VAIBot API                    On-chain
 
 Tools prefixed with `mcp__vaibot` are skipped automatically to prevent the governance plugin from governing itself.
 
+## Community & support
+
+**[Join the VAIBot Discord](https://discord.gg/mSHYtP5nV)** — get help, share feedback, and connect with other users.
+
+VAIBot is in early access. If you're installing this plugin now, you're among the first developers putting verifiable AI governance into production. Early community members shape the roadmap directly — feature requests, policy design, and integration patterns all come from conversations in Discord.
+
+To become a founding member, join the Discord and introduce yourself in **#founding-members**. Founding members get:
+- Direct access to the VAIBot team
+- Early previews of upcoming governance features
+- Input on default policy design and approval workflows
+- Recognition in the project
+
 ## Uninstall
 
 Remove the plugin path from `.claude/plugins.json` or stop passing `--plugin-dir`. No state is written outside `~/.vaibot/` and a system temp directory (`/tmp/vaibot-claudecode/`).
