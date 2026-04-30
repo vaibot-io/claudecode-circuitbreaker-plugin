@@ -4,6 +4,22 @@ A Claude Code plugin that intercepts every tool call, evaluates it against your 
 
 VAIBot classifies each tool call by risk and returns an allow, deny, or approval-required verdict. Every decision creates a tamper-evident receipt with on-chain provenance anchoring. The plugin works with zero configuration — a free account is provisioned automatically on first run.
 
+## Plugin vs. MCP server
+
+VAIBot also ships an MCP server that exposes governance tools Claude can call voluntarily. The plugin and the MCP server are complementary — they serve different roles:
+
+| | MCP server | This plugin |
+|---|---|---|
+| Agent queries policy / status | ✓ | ✗ |
+| Agent approves actions in-session | ✓ | ✓ |
+| Enforcement happens before execution | ✗ | ✓ |
+| Agent can skip or bypass the check | ✓ | ✗ |
+| Audit trail the agent can't forge | ✗ | ✓ |
+
+The MCP server gives the agent a way to query and interact with VAIBot. This plugin is what makes governance **mandatory** — it hooks into Claude Code's PreToolUse event before the tool executes, regardless of what the agent chooses to do. If the goal is a tamper-evident audit record or blocking a misbehaving agent, the plugin is the enforcement layer that actually enforces it.
+
+Most deployments use both: the plugin for mandatory pre-execution enforcement, the MCP server so the agent can surface policy context and manage approvals in-session.
+
 ## Quick start
 
 ```bash
