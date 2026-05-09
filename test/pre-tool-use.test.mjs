@@ -520,3 +520,109 @@ test('approval_required + nudge marker already present → no second nudge', asy
     try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
   }
 })
+
+// ── fingerprint idempotency ───────────────────────────────────────────────────
+// Regression guard for the cwd-stripping change. Running the hook from two
+// different working directories on the same machine MUST send the same
+// fingerprint to /v2/bootstrap. Previously the fingerprint included process.cwd
+// and a developer would accumulate one bootstrap_accounts row per cwd they ever
+// launched Claude Code from.
+
+test('bootstrap fingerprint is identical across different cwds (no cwd in formula)', async () => {
+  // Two empty tmp dirs to use as cwd. They differ in path; same machine, same user.
+  const cwdA = mkdtempSync(join(tmpdir(), 'fp-cwd-a-'))
+  const cwdB = mkdtempSync(join(tmpdir(), 'fp-cwd-b-'))
+  // Empty fake HOME so the hook can't read any cached api_key — forces bootstrap call.
+  const fakeHome = mkdtempSync(join(tmpdir(), 'fp-home-'))
+
+  const fingerprints = []
+  const server = await startMockServer((req) => {
+    if (req.url === '/v2/bootstrap') {
+      fingerprints.push(req.body.fingerprint)
+      return {
+        status: 201,
+        body: {
+          ok: true,
+          bootstrapped: true,
+          api_key: 'vb_stg_' + 'a'.repeat(48),
+          account_id: '0xfake',
+          user_id: 'user_fake',
+          wallet_address: '0xfake',
+          wallet_network: 'base-sepolia',
+        },
+      }
+    }
+    if (req.url === '/v2/governance/decide') {
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          run_id: 'run_x',
+          risk: { risk: 'low', reason: 'low' },
+          decision: { decision: 'allow', reason: 'low' },
+          shadow_decision: { decision: 'allow', reason: 'low' },
+          content_hash: 'sha256:fp_test',
+          receipt_id: 'grcpt_fp',
+        },
+      }
+    }
+    if (req.url === '/v2/accounts/me') {
+      return { status: 200, body: { ok: true, claimed: true } }
+    }
+    return { status: 200, body: { ok: true } }
+  })
+
+  function runFromCwd(cwd) {
+    return new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [SCRIPT], {
+        cwd,
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          VAIBOT_API_URL: server.url,
+          VAIBOT_API_KEY: '',
+          VAIBOT_MODE: 'enforce',
+          VAIBOT_TIMEOUT_MS: '2000',
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      let stdout = ''
+      let stderr = ''
+      child.stdout.on('data', (c) => { stdout += c })
+      child.stderr.on('data', (c) => { stderr += c })
+      child.on('error', reject)
+      child.on('exit', (code) => resolve({ code, stdout, stderr }))
+      child.stdin.write(JSON.stringify({
+        tool_name: 'Bash',
+        tool_input: { command: 'echo test', cwd },
+        session_id: 'fp-session',
+      }))
+      child.stdin.end()
+    })
+  }
+
+  try {
+    // First call from cwdA — bootstraps fresh (no cached creds in fakeHome).
+    const resA = await runFromCwd(cwdA)
+    assert.equal(resA.code, 0, 'first call exits 0')
+    // Wipe the credentials.json the first call cached so the second call also
+    // takes the bootstrap path. Otherwise it'd reuse the cached api_key and
+    // never send a fingerprint.
+    try { rmSync(join(fakeHome, '.vaibot'), { recursive: true, force: true }) } catch {}
+
+    const resB = await runFromCwd(cwdB)
+    assert.equal(resB.code, 0, 'second call exits 0')
+
+    assert.equal(fingerprints.length, 2, 'both calls hit bootstrap')
+    assert.equal(
+      fingerprints[0],
+      fingerprints[1],
+      `cwd-A fingerprint (${fingerprints[0]?.slice(0, 12)}…) must equal cwd-B fingerprint (${fingerprints[1]?.slice(0, 12)}…) — bootstrap idempotency depends on cwd being absent from the formula`,
+    )
+  } finally {
+    await server.close()
+    try { rmSync(cwdA, { recursive: true, force: true }) } catch {}
+    try { rmSync(cwdB, { recursive: true, force: true }) } catch {}
+    try { rmSync(fakeHome, { recursive: true, force: true }) } catch {}
+  }
+})

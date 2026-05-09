@@ -65,10 +65,15 @@ const MODE = process.env.VAIBOT_MODE ?? 'observe'
 // Used for bootstrap idempotency and abuse pattern detection.
 
 function getFingerprint() {
+  // Identifier for bootstrap idempotency. NOT cwd-dependent — running the
+  // plugin from any directory on the same user@host yields the same
+  // fingerprint, so each developer gets exactly ONE bootstrap account per
+  // machine instead of one-per-cwd. For cross-machine identity continuity,
+  // propagate the cached api_key (in ~/.vaibot/credentials.json) via the
+  // VAIBOT_API_KEY env var rather than trying to share a fingerprint.
   const user = userInfo().username
   const host = hostname()
-  const cwd = process.cwd()
-  return createHash('sha256').update(`${user}@${host}:${cwd}`).digest('hex')
+  return createHash('sha256').update(`${user}@${host}`).digest('hex')
 }
 
 // ── Auto-bootstrap ─────────────────────────────────────────────────────────
