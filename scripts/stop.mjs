@@ -14,22 +14,14 @@
  *   VAIBOT_TIMEOUT_MS — request timeout in ms (default: 10000)
  */
 
-import { existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
+import { readFileSync, readdirSync, unlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { resolveCredentials } from './lib/creds.mjs'
 
-const CREDS_FILE = join(homedir(), '.vaibot', 'credentials.json')
-
-function loadSavedCredentials() {
-  try {
-    if (existsSync(CREDS_FILE)) return JSON.parse(readFileSync(CREDS_FILE, 'utf-8'))
-  } catch { /* ignore corrupt file */ }
-  return null
-}
-
-const API_URL = (process.env.VAIBOT_API_URL ?? 'https://api.vaibot.io').replace(/\/+$/, '')
-const savedCreds = loadSavedCredentials()
-const API_KEY = process.env.VAIBOT_API_KEY ?? savedCreds?.api_key ?? ''
+const resolved = resolveCredentials()
+const API_URL = resolved.apiBaseUrl
+const API_KEY = resolved.apiKey ?? ''
 const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
 
 const STATE_DIR = join(tmpdir(), 'vaibot-claudecode')

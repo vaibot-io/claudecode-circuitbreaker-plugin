@@ -11,28 +11,19 @@
  *   VAIBOT_TIMEOUT_MS — request timeout in ms (default: 10000)
  */
 
-import { existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
+import { readFileSync, readdirSync, unlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { resolveCredentials, credsPath } from './lib/creds.mjs'
 
-// Credentials file — shared with pre-tool-use.mjs. The pre-hook's auto-bootstrap
-// writes the account's api_key here on first run; the post-hook must read the
-// same file to finalize receipts the pre-hook created. Reading env takes
-// precedence so an explicit VAIBOT_API_KEY always wins.
-const CREDS_FILE = join(homedir(), '.vaibot', 'credentials.json')
-
-function loadSavedCredentials() {
-  try {
-    if (existsSync(CREDS_FILE)) {
-      return JSON.parse(readFileSync(CREDS_FILE, 'utf-8'))
-    }
-  } catch { /* ignore corrupt file */ }
-  return null
-}
-
-const API_URL = (process.env.VAIBOT_API_URL ?? 'https://api.vaibot.io').replace(/\/+$/, '')
-const savedCreds = loadSavedCredentials()
-const API_KEY = process.env.VAIBOT_API_KEY ?? savedCreds?.api_key ?? ''
+// Credentials — shared with pre-tool-use.mjs via the env-namespaced store. The
+// pre-hook's auto-bootstrap writes the account's api_key for the resolved env;
+// the post-hook resolves the same env to finalize receipts the pre-hook created.
+// An explicit VAIBOT_API_KEY / VAIBOT_API_URL always wins (handled in resolver).
+const CREDS_FILE = credsPath()
+const resolved = resolveCredentials()
+const API_URL = resolved.apiBaseUrl
+const API_KEY = resolved.apiKey ?? ''
 const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
 
 const STATE_DIR = join(tmpdir(), 'vaibot-claudecode')

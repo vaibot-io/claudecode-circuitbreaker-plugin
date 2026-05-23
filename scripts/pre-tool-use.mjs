@@ -24,40 +24,32 @@ import { createHash } from 'node:crypto'
 import { writeFileSync, readFileSync, readdirSync, mkdirSync, existsSync, unlinkSync } from 'node:fs'
 import { tmpdir, hostname, userInfo } from 'node:os'
 import { join } from 'node:path'
-import { homedir } from 'node:os'
+import { resolveCredentials, saveCredsForEnv, migrateFileIfNeeded, credsPath } from './lib/creds.mjs'
 
-// ── Credentials file ───────────────────────────────────────────────────────
+// ── Credentials + environment ────────────────────────────────────────────────
+// One env-namespaced store (~/.vaibot/credentials.json), via the vendored copy
+// of @vaibot/shared/creds. migrateFileIfNeeded upgrades any legacy flat file in
+// place; resolveCredentials picks the env (production/staging) plus the matching
+// key + base URL, and flags a key whose prefix names the wrong env.
 
-const CREDS_DIR = join(homedir(), '.vaibot')
-const CREDS_FILE = join(CREDS_DIR, 'credentials.json')
-
-function loadSavedCredentials() {
-  try {
-    if (existsSync(CREDS_FILE)) {
-      return JSON.parse(readFileSync(CREDS_FILE, 'utf-8'))
-    }
-  } catch { /* ignore corrupt file */ }
-  return null
-}
-
-function saveCredentials(creds) {
-  try {
-    mkdirSync(CREDS_DIR, { recursive: true, mode: 0o700 })
-    writeFileSync(CREDS_FILE, JSON.stringify(creds, null, 2), { mode: 0o600 })
-  } catch { /* best-effort */ }
+migrateFileIfNeeded()
+const resolved = resolveCredentials()
+const ENV = resolved.env
+const API_URL = resolved.apiBaseUrl
+const CREDS_FILE = credsPath()
+let API_KEY = resolved.apiKey ?? ''
+if (resolved.keyMismatch) {
+  process.stderr.write(
+    `VAIBot: ignoring a stored API key whose prefix doesn't match env="${ENV}" — re-bootstrapping.\n`,
+  )
 }
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-const API_URL = (process.env.VAIBOT_API_URL ?? 'https://api.vaibot.io').replace(/\/+$/, '')
 const DASHBOARD_URL = (process.env.VAIBOT_DASHBOARD_URL ?? 'https://www.vaibot.io').replace(/\/+$/, '')
 const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
 const AGENT_MODEL = 'claude-code'
 const FAIL_OPEN = process.env.VAIBOT_FAIL_OPEN === 'true'
-
-// API key: env var > saved credentials
-const savedCreds = loadSavedCredentials()
-let API_KEY = process.env.VAIBOT_API_KEY ?? savedCreds?.api_key ?? ''
 const MODE = process.env.VAIBOT_MODE ?? 'observe'
 
 // ── Fingerprint ────────────────────────────────────────────────────────────
@@ -97,15 +89,7 @@ async function bootstrap() {
 
   if (data.api_key) {
     // New account — wallet address is the canonical identity
-    saveCredentials({
-      api_key: data.api_key,
-      account_id: data.account_id,
-      user_id: data.user_id,
-      wallet_address: data.wallet_address,
-      wallet_network: data.wallet_network,
-      api_url: API_URL,
-      bootstrapped_at: new Date().toISOString(),
-    })
+    saveCredsForEnv(ENV, { api_key: data.api_key, wallet_address: data.wallet_address })
     const claimUrl = `${DASHBOARD_URL}/claim?api_key=${encodeURIComponent(data.api_key)}`
     process.stderr.write(
       `VAIBot: account provisioned. Credentials saved to ${CREDS_FILE}\n` +
