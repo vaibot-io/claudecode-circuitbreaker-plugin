@@ -21,7 +21,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { writeFileSync, readFileSync, readdirSync, mkdirSync, existsSync, unlinkSync } from 'node:fs'
+import { writeFileSync, readFileSync, readdirSync, mkdirSync, existsSync, unlinkSync, chmodSync } from 'node:fs'
 import { tmpdir, hostname, userInfo } from 'node:os'
 import { join } from 'node:path'
 import { resolveCredentials, saveCredsForEnv, migrateFileIfNeeded, credsPath } from './lib/creds.mjs'
@@ -117,10 +117,22 @@ async function bootstrap() {
 const STATE_DIR = join(tmpdir(), 'vaibot-claudecode')
 const PENDING_DIR = join(STATE_DIR, 'pending')
 
+// State files contain run IDs, content hashes, intent hashes, and tool names —
+// not credentials, but enumerable metadata about agent activity. Keep STATE_DIR
+// 0o700 and state files 0o600 so other local users on a shared host can't read
+// them. mkdirSync only applies `mode` to dirs it creates, so chmod legacy dirs
+// from older plugin versions (which used default umask) on every touch.
+function ensureStateDir() {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    chmodSync(STATE_DIR, 0o700)
+  } catch { /* best-effort */ }
+}
+
 function saveRunState(toolCallId, state) {
   try {
-    mkdirSync(STATE_DIR, { recursive: true })
-    writeFileSync(join(STATE_DIR, `${toolCallId}.json`), JSON.stringify(state))
+    ensureStateDir()
+    writeFileSync(join(STATE_DIR, `${toolCallId}.json`), JSON.stringify(state), { mode: 0o600 })
   } catch { /* best-effort */ }
 }
 
@@ -191,6 +203,7 @@ function readPendingApproval(tool, command, cwd) {
 
 function writePendingApproval(tool, command, cwd, contentHash) {
   try {
+    ensureStateDir()
     mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
     writeFileSync(pendingPath(tool, command, cwd), JSON.stringify({ content_hash: contentHash, ts: Date.now() }), { mode: 0o600 })
   } catch { /* best-effort */ }
@@ -218,6 +231,7 @@ function alreadyNudged(sessionId) {
 
 function markNudged(sessionId) {
   try {
+    ensureStateDir()
     mkdirSync(NUDGED_DIR, { recursive: true, mode: 0o700 })
     writeFileSync(nudgeMarkerPath(sessionId), String(Date.now()), { mode: 0o600 })
   } catch { /* best-effort */ }

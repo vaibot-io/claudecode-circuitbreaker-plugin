@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
-import { mkdtempSync, existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync, rmSync, statSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -624,5 +624,73 @@ test('bootstrap fingerprint is identical across different cwds (no cwd in formul
     try { rmSync(cwdA, { recursive: true, force: true }) } catch {}
     try { rmSync(cwdB, { recursive: true, force: true }) } catch {}
     try { rmSync(fakeHome, { recursive: true, force: true }) } catch {}
+  }
+})
+
+const STATE_DIR = join(tmpdir(), 'vaibot-claudecode')
+
+test('STATE_DIR is created 0o700 and saved state files are 0o600 (no metadata leak on shared hosts)', async () => {
+  try { rmSync(STATE_DIR, { recursive: true, force: true }) } catch {}
+  const server = await startMockServer(() => ({
+    status: 200,
+    body: {
+      ok: true,
+      run_id: 'run_perms',
+      risk: { risk: 'low', reason: 'safe' },
+      decision: { decision: 'allow', reason: 'ok' },
+      shadow_decision: { decision: 'allow', reason: 'ok' },
+      content_hash: 'sha256:perms',
+    },
+  }))
+  try {
+    await runHook({
+      apiUrl: server.url,
+      input: { tool_name: 'Bash', tool_input: { command: uniqCmd('echo perms') }, session_id: 'sess_perms', tool_use_id: 'tu_perms' },
+    })
+
+    const dirMode = statSync(STATE_DIR).mode & 0o777
+    assert.equal(dirMode, 0o700, `STATE_DIR should be 0o700, got 0o${dirMode.toString(8)}`)
+
+    const stateFiles = readdirSync(STATE_DIR).filter((f) => f.endsWith('.json'))
+    assert.ok(stateFiles.length > 0, 'expected at least one state file')
+    for (const f of stateFiles) {
+      const m = statSync(join(STATE_DIR, f)).mode & 0o777
+      assert.equal(m, 0o600, `state file ${f} should be 0o600, got 0o${m.toString(8)}`)
+    }
+  } finally {
+    await server.close()
+    try { rmSync(STATE_DIR, { recursive: true, force: true }) } catch {}
+  }
+})
+
+test('STATE_DIR perms are tightened on the fly when a legacy 0o755 dir already exists', async () => {
+  // Simulates an upgrade from an older plugin version that created STATE_DIR
+  // with default (umask-respecting) perms. The current code must chmod down to
+  // 0o700 on next touch — otherwise the leak persists across plugin upgrades.
+  try { rmSync(STATE_DIR, { recursive: true, force: true }) } catch {}
+  mkdirSync(STATE_DIR, { recursive: true })
+  chmodSync(STATE_DIR, 0o755)
+  assert.equal(statSync(STATE_DIR).mode & 0o777, 0o755, 'precondition: legacy 0o755 dir')
+
+  const server = await startMockServer(() => ({
+    status: 200,
+    body: {
+      ok: true,
+      run_id: 'run_chmod',
+      risk: { risk: 'low', reason: 'safe' },
+      decision: { decision: 'allow', reason: 'ok' },
+      shadow_decision: { decision: 'allow', reason: 'ok' },
+      content_hash: 'sha256:chmod',
+    },
+  }))
+  try {
+    await runHook({
+      apiUrl: server.url,
+      input: { tool_name: 'Bash', tool_input: { command: uniqCmd('echo chmod') }, session_id: 'sess_chmod', tool_use_id: 'tu_chmod' },
+    })
+    assert.equal(statSync(STATE_DIR).mode & 0o777, 0o700, 'legacy dir should be tightened to 0o700')
+  } finally {
+    await server.close()
+    try { rmSync(STATE_DIR, { recursive: true, force: true }) } catch {}
   }
 })
