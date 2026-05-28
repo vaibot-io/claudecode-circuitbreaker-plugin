@@ -22,18 +22,25 @@ Most deployments use both: the plugin for mandatory pre-execution enforcement, t
 
 ## Quick start
 
-```bash
-claude --plugin-dir /path/to/claudecode-circuitbreaker-plugin
+Install in three steps from inside a Claude Code session:
+
+```text
+# 1. Register the marketplace (clones the GitHub repo into Claude Code's cache)
+/plugin marketplace add vaibot-io/claudecode-circuitbreaker-plugin
+
+# 2. Install the plugin from that marketplace
+/plugin install vaibot-governance@vaibot-claudecode
+
+# 3. Activate without restarting Claude Code
+/reload-plugins
 ```
 
-Or add to your project's `.claude/plugins.json`:
+The plugin lands at `~/.claude/plugins/cache/.../vaibot-governance/<version>/` (e.g. `0.2.2/`). On first tool call the plugin auto-bootstraps a free-tier VAIBot account using a machine fingerprint and saves credentials to `~/.vaibot/credentials.json`.
 
-```json
-{
-  "plugins": [
-    { "path": "./packages/claudecode-circuitbreaker-plugin" }
-  ]
-}
+For local development you can also load the plugin directly from this checkout without going through the marketplace:
+
+```bash
+claude --plugin-dir /path/to/claudecode-circuitbreaker-plugin
 ```
 
 ## What you see at runtime
