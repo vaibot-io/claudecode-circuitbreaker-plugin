@@ -46,10 +46,17 @@ function startMockServer(handler) {
 }
 
 function runHook({ apiUrl, mode = 'enforce', input }) {
+  // Per-call fake HOME isolates the new breaker-state file at
+  // ~/.vaibot/breaker-state/claudecode.json from the user's real home and
+  // from other test runs. STATE_DIR (/tmp/vaibot-claudecode/) is intentionally
+  // NOT sandboxed here — existing tests reach into it via path helpers; the
+  // new breaker.test.mjs sandboxes it via TMPDIR for its own scenarios.
+  const fakeHome = mkdtempSync(join(tmpdir(), 'vaibot-claudecode-test-home-'))
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [SCRIPT], {
       env: {
         ...process.env,
+        HOME: fakeHome,
         VAIBOT_API_URL: apiUrl,
         VAIBOT_API_KEY: 'test-key',
         VAIBOT_MODE: mode,
@@ -61,8 +68,11 @@ function runHook({ apiUrl, mode = 'enforce', input }) {
     let stderr = ''
     child.stdout.on('data', (c) => { stdout += c })
     child.stderr.on('data', (c) => { stderr += c })
-    child.on('error', reject)
-    child.on('exit', (code) => resolve({ code, stdout, stderr }))
+    child.on('error', (err) => { try { rmSync(fakeHome, { recursive: true, force: true }) } catch {} ; reject(err) })
+    child.on('exit', (code) => {
+      try { rmSync(fakeHome, { recursive: true, force: true }) } catch {}
+      resolve({ code, stdout, stderr })
+    })
     child.stdin.write(JSON.stringify(input))
     child.stdin.end()
   })

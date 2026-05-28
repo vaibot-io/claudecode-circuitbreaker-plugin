@@ -21,10 +21,16 @@
  */
 
 import { createHash } from 'node:crypto'
-import { writeFileSync, readFileSync, readdirSync, mkdirSync, existsSync, unlinkSync, chmodSync } from 'node:fs'
-import { tmpdir, hostname, userInfo } from 'node:os'
+import { writeFileSync, readFileSync, readdirSync, mkdirSync, existsSync, unlinkSync, chmodSync, renameSync } from 'node:fs'
+import { tmpdir, hostname, homedir, userInfo } from 'node:os'
 import { join } from 'node:path'
 import { resolveCredentials, saveCredsForEnv, migrateFileIfNeeded, credsPath } from './lib/creds.mjs'
+import {
+  CircuitBreaker,
+  DEFAULT_FAILURE_THRESHOLD,
+  DEFAULT_WINDOW_MS,
+  DEFAULT_COOLDOWN_MS,
+} from './lib/circuit-breaker.mjs'
 
 // ── Credentials + environment ────────────────────────────────────────────────
 // One env-namespaced store (~/.vaibot/credentials.json), via the vendored copy
@@ -51,6 +57,117 @@ const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
 const AGENT_MODEL = 'claude-code'
 const FAIL_OPEN = process.env.VAIBOT_FAIL_OPEN === 'true'
 const MODE = process.env.VAIBOT_MODE ?? 'observe'
+
+// ── Circuit breaker ────────────────────────────────────────────────────────
+// Local fallback. Sliding-window failure counter: N transient API errors
+// (5xx / network) inside windowMs trip the breaker for cooldownMs. While
+// tripped, tools are decided locally — allowlist passes, denylist blocks,
+// anything else gets a deny-with-reason. 401/403 (auth) and other 4xx (real
+// verdicts) do NOT count as transient failures. State lives in
+// ~/.vaibot/breaker-state/claudecode.json so trip state survives Claude
+// Code restarts. To functionally disable, set
+// VAIBOT_BREAKER_FAILURE_THRESHOLD to a number you'll never reach.
+//
+// Defaults mirror packages/openclaw-circuitbreaker-plugin.
+
+function parseList(envVal, fallback) {
+  if (!envVal || envVal.trim() === '') return fallback
+  return envVal.split(',').map((s) => s.trim()).filter(Boolean)
+}
+
+const BREAKER_CFG = {
+  failureThreshold:
+    Number(process.env.VAIBOT_BREAKER_FAILURE_THRESHOLD) || DEFAULT_FAILURE_THRESHOLD,
+  windowMs: Number(process.env.VAIBOT_BREAKER_WINDOW_MS) || DEFAULT_WINDOW_MS,
+  cooldownMs: Number(process.env.VAIBOT_BREAKER_COOLDOWN_MS) || DEFAULT_COOLDOWN_MS,
+  allowlist: parseList(process.env.VAIBOT_BREAKER_ALLOWLIST, ['Read', 'Grep', 'Glob']),
+  denylist: parseList(process.env.VAIBOT_BREAKER_DENYLIST, []),
+}
+
+const BREAKER_STATE_DIR = join(homedir(), '.vaibot', 'breaker-state')
+const BREAKER_STATE_FILE = join(BREAKER_STATE_DIR, 'claudecode.json')
+
+function loadBreakerSnapshot() {
+  try {
+    const raw = JSON.parse(readFileSync(BREAKER_STATE_FILE, 'utf-8'))
+    return raw?.breaker ?? null
+  } catch {
+    return null
+  }
+}
+
+function saveBreakerSnapshot(snap) {
+  try {
+    mkdirSync(BREAKER_STATE_DIR, { recursive: true, mode: 0o700 })
+    chmodSync(BREAKER_STATE_DIR, 0o700)
+    const tmp = `${BREAKER_STATE_FILE}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`
+    writeFileSync(
+      tmp,
+      JSON.stringify({ version: 1, breaker: snap, updated_at: Date.now() }) + '\n',
+      { mode: 0o600 },
+    )
+    renameSync(tmp, BREAKER_STATE_FILE)
+  } catch {
+    /* best-effort — state is an optimization, not correctness-critical */
+  }
+}
+
+function isTransientHttpFailure(status) {
+  return status >= 500 && status < 600
+}
+
+// Emits the deny/allow when the breaker is tripped. Caller exits 0 and saves
+// the snapshot. Claude Code emits explicit `permissionDecision: 'allow'` /
+// `'deny'` shapes (unlike codex, where empty stdout = allow).
+function applyBreakerTrippedDecision(breaker, toolName) {
+  if (MODE === 'observe') {
+    process.stderr.write(
+      `VAIBot [breaker observe]: tripped — would block ${toolName} ` +
+      `(not in allowlist) [observe mode allows]\n`,
+    )
+    return
+  }
+
+  if (breaker.isDenied(toolName)) {
+    const denyReason = `VAIBot circuit breaker tripped — ${toolName} is in the breaker denylist.`
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: denyReason,
+      },
+    }))
+    process.stderr.write(`VAIBot: ${denyReason}\n`)
+    return
+  }
+
+  if (breaker.canAllow(toolName)) {
+    process.stderr.write(
+      `VAIBot [breaker]: tripped — allowlist pass-through for ${toolName}\n`,
+    )
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'allow',
+      },
+    }))
+    return
+  }
+
+  const cooldownSec = Math.round(BREAKER_CFG.cooldownMs / 1000)
+  const denyReason =
+    `VAIBot circuit breaker tripped — V2 governance API failed ${BREAKER_CFG.failureThreshold}+ times recently.\n` +
+    `${toolName} is not on the breaker allowlist; blocking until cooldown (${cooldownSec}s) or API recovery.\n` +
+    `To override: add ${toolName} to VAIBOT_BREAKER_ALLOWLIST, raise VAIBOT_BREAKER_FAILURE_THRESHOLD, or wait.`
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: denyReason,
+    },
+  }))
+  process.stderr.write(`VAIBot: ${denyReason}\n`)
+}
 
 // ── Fingerprint ────────────────────────────────────────────────────────────
 // Forensic correlation signal — NOT machine attestation.
@@ -354,6 +471,18 @@ async function main() {
   // this sweep is the first place the denial gets recorded server-side.
   await sweepPendingApprovals({ excludeToolUseId: toolUseId })
 
+  // ── Breaker check (before any API call) ──
+  // Load persisted state from disk and check trip. Tripped → decide locally and
+  // exit before incurring another API attempt. isTripped() auto-resets state if
+  // the cooldown has elapsed; save the snapshot either way so the reset persists.
+  const breaker = new CircuitBreaker(BREAKER_CFG)
+  breaker.load(loadBreakerSnapshot())
+  if (breaker.isTripped()) {
+    applyBreakerTrippedDecision(breaker, toolName)
+    saveBreakerSnapshot(breaker.snapshot())
+    process.exit(0)
+  }
+
   const command = extractCommand(toolName, toolInput)
   const target = extractTarget(toolName, toolInput)
   const cwd = extractCwd(toolName, toolInput)
@@ -397,12 +526,28 @@ async function main() {
 
     if (!res.ok) {
       const text = await res.text().catch(() => '')
+
+      // Breaker accounting: only 5xx counts as a transient failure. 401/403
+      // (auth) and other 4xx (verdicts) do NOT trip the breaker.
+      if (isTransientHttpFailure(res.status)) {
+        breaker.recordFailure(`API ${res.status}`)
+        saveBreakerSnapshot(breaker.snapshot())
+        if (breaker.isTripped()) {
+          applyBreakerTrippedDecision(breaker, toolName)
+          process.exit(0)
+        }
+      }
+
       if (FAIL_OPEN || MODE === 'observe') process.exit(0)
       process.stderr.write(`VAIBot: governance API returned ${res.status}: ${text.slice(0, 200)}\n`)
       process.exit(2)
     }
 
     const data = await res.json()
+
+    // API call succeeded — reset the breaker's failure window.
+    breaker.recordSuccess()
+    saveBreakerSnapshot(breaker.snapshot())
 
     if (process.env.VAIBOT_DEBUG === '1') {
       process.stderr.write(
@@ -512,6 +657,14 @@ async function main() {
     process.exit(0)
 
   } catch (err) {
+    // Breaker accounting: network errors / timeouts are transient.
+    breaker.recordFailure(`network: ${err.message}`)
+    saveBreakerSnapshot(breaker.snapshot())
+    if (breaker.isTripped()) {
+      applyBreakerTrippedDecision(breaker, toolName)
+      process.exit(0)
+    }
+
     // Network error, timeout, etc.
     if (FAIL_OPEN || MODE === 'observe') {
       process.stderr.write(`VAIBot [error]: ${err.message}\n`)

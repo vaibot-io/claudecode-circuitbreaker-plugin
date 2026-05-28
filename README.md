@@ -113,6 +113,32 @@ All environment variables are optional.
 | `VAIBOT_TIMEOUT_MS` | `10000` | Request timeout in ms |
 | `VAIBOT_FAIL_OPEN` | `false` | If `true`, allow tool calls when the API is unreachable |
 | `VAIBOT_DEBUG` | _(unset)_ | Set to `1` for verbose decision logging |
+| `VAIBOT_BREAKER_FAILURE_THRESHOLD` | `3` | Transient API failures within `WINDOW_MS` that trip the local breaker |
+| `VAIBOT_BREAKER_WINDOW_MS` | `10000` | Sliding window for failure counting, in ms |
+| `VAIBOT_BREAKER_COOLDOWN_MS` | `60000` | Auto-reset window after the breaker trips, in ms |
+| `VAIBOT_BREAKER_ALLOWLIST` | `Read,Grep,Glob` | Comma-separated tool names that pass through when the breaker is tripped |
+| `VAIBOT_BREAKER_DENYLIST` | _(empty)_ | Tool names blocked when tripped (denylist wins over allowlist) |
+
+## Local breaker (offline fallback)
+
+When the V2 governance API is unreachable, repeated transient failures trip a
+local circuit breaker that takes over until the API recovers. Sliding window:
+`VAIBOT_BREAKER_FAILURE_THRESHOLD` failures inside `VAIBOT_BREAKER_WINDOW_MS`
+trip the breaker for `VAIBOT_BREAKER_COOLDOWN_MS`. While tripped:
+
+- Tools in `VAIBOT_BREAKER_ALLOWLIST` pass through (`permissionDecision: allow`).
+- Tools in `VAIBOT_BREAKER_DENYLIST` are blocked (`permissionDecision: deny`).
+- Anything else gets a deny with an actionable reason (add to allowlist, raise
+  the threshold, or wait for cooldown).
+
+Only 5xx responses and network errors count as transient failures. 401/403
+(authentication) and other 4xx responses do **not** trip the breaker — those
+are real verdicts or config problems, not transient outages.
+
+Breaker state persists at `~/.vaibot/breaker-state/claudecode.json` (mode
+`0o600`) so trip state survives Claude Code restarts. In observe mode the
+breaker still tracks failures but never blocks — it just logs a breadcrumb
+when tripped.
 
 ## How decisions flow
 
