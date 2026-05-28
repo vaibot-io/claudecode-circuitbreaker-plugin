@@ -1,0 +1,20 @@
+{
+  "name": "vaibot-governance-marketplace",
+  "interface": {
+    "displayName": "VAIbot Governance — Claude Code"
+  },
+  "plugins": [
+    {
+      "name": "vaibot-governance",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Security"
+    }
+  ]
+}
