@@ -1,6 +1,6 @@
 {
   "name": "@vaibot/claudecode-circuitbreaker-plugin",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "VAIBot governance plugin for Claude Code — intercepts tool calls, classifies risk, enforces policy, and creates tamper-evident audit receipts with on-chain provenance anchoring.",
   "license": "MIT",
   "type": "module",
