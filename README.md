@@ -123,8 +123,7 @@ All environment variables are optional.
 | `VAIBOT_BREAKER_FAILURE_THRESHOLD` | `3` | Transient API failures within `WINDOW_MS` that trip the local breaker |
 | `VAIBOT_BREAKER_WINDOW_MS` | `10000` | Sliding window for failure counting, in ms |
 | `VAIBOT_BREAKER_COOLDOWN_MS` | `60000` | Auto-reset window after the breaker trips, in ms |
-| `VAIBOT_BREAKER_ALLOWLIST` | `Read,Grep,Glob` | Comma-separated tool names that pass through when the breaker is tripped |
-| `VAIBOT_BREAKER_DENYLIST` | _(empty)_ | Tool names blocked when tripped (denylist wins over allowlist) |
+| `VAIBOT_BREAKER_DENYLIST` | _(empty)_ | Tool names always blocked when tripped (the un-overridable safety floor) |
 
 ## Local breaker (offline fallback)
 
@@ -133,10 +132,11 @@ local circuit breaker that takes over until the API recovers. Sliding window:
 `VAIBOT_BREAKER_FAILURE_THRESHOLD` failures inside `VAIBOT_BREAKER_WINDOW_MS`
 trip the breaker for `VAIBOT_BREAKER_COOLDOWN_MS`. While tripped:
 
-- Tools in `VAIBOT_BREAKER_ALLOWLIST` pass through (`permissionDecision: allow`).
+- The local **risk classifier** re-decides each call: classifier-safe tools
+  pass through (`permissionDecision: allow`).
 - Tools in `VAIBOT_BREAKER_DENYLIST` are blocked (`permissionDecision: deny`).
-- Anything else gets a deny with an actionable reason (add to allowlist, raise
-  the threshold, or wait for cooldown).
+- Anything the classifier would ask/deny is denied with an actionable reason
+  (approval can't be requested while offline — wait for cooldown or API recovery).
 
 Only 5xx responses and network errors count as transient failures. 401/403
 (authentication) and other 4xx responses do **not** trip the breaker — those

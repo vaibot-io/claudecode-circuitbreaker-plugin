@@ -16,8 +16,10 @@
 //   - isTripped() auto-resets after cooldownMs from trippedAt — first
 //     read past the cooldown clears state and returns false.
 //   - recordSuccess() clears all state (failures, tripped, last error).
-//   - canAllow(toolName) is a static allowlist/denylist check: denylist
-//     wins over allowlist (deny is terminal).
+//   - isDenied(toolName) is a static denylist check — the un-overridable
+//     safety floor. There is deliberately NO allowlist: whether a tool may
+//     pass through a tripped breaker is decided by the risk classifier
+//     (@vaibot/shared/classifier), never by a mutable/learned list.
 //
 // State serialization:
 //   snapshot() / load() round-trip { failures, trippedAt, lastError }.
@@ -34,8 +36,7 @@ export const DEFAULT_COOLDOWN_MS = 60_000
  * @property {number} [failureThreshold] — failures within windowMs that trip the breaker (default 3)
  * @property {number} [windowMs]         — sliding window for failure counting (default 10000 ms)
  * @property {number} [cooldownMs]       — auto-reset window after tripping (default 60000 ms)
- * @property {string[]} [allowlist]      — tool names that pass through when tripped
- * @property {string[]} [denylist]       — tool names that are blocked when tripped (denylist wins over allowlist)
+ * @property {string[]} [denylist]       — tool names blocked when tripped (the un-overridable safety floor)
  */
 
 /**
@@ -60,7 +61,6 @@ function normalizeConfig(cfg) {
       Number.isFinite(cfg.cooldownMs) && cfg.cooldownMs > 0
         ? Number(cfg.cooldownMs)
         : DEFAULT_COOLDOWN_MS,
-    allowlist: Array.isArray(cfg.allowlist) ? cfg.allowlist.slice() : [],
     denylist: Array.isArray(cfg.denylist) ? cfg.denylist.slice() : [],
   }
 }
@@ -121,20 +121,12 @@ export class CircuitBreaker {
   }
 
   /**
-   * Allowlist/denylist check, independent of trip state. Callers decide
-   * when to consult this — typically only after isTripped() returns true.
-   * Denylist wins over allowlist (deny is terminal).
+   * Static denylist check, independent of trip state — the un-overridable
+   * safety floor. Whether a non-denied tool may pass through a tripped
+   * breaker is decided by the risk classifier, not by this class.
    *
-   * @param {string} toolName
-   * @returns {boolean} true if the tool should be allowed
+   * @param {string} toolName — true iff in denylist
    */
-  canAllow(toolName) {
-    if (this.cfg.denylist.includes(toolName)) return false
-    if (this.cfg.allowlist.includes(toolName)) return true
-    return false
-  }
-
-  /** @param {string} toolName — true iff in denylist */
   isDenied(toolName) {
     return this.cfg.denylist.includes(toolName)
   }
