@@ -56,6 +56,8 @@ function runHook({ apiUrl, mode = 'enforce', input, env = {}, home }) {
         HOME: home,
         TMPDIR: fakeTmp,
         VAIBOT_API_URL: apiUrl,
+        VAIBOT_GUARD_BASE_URL: apiUrl,
+        VAIBOT_GUARD_TOKEN: 'test-guard-token',
         VAIBOT_API_KEY: 'test-key',
         VAIBOT_MODE: mode,
         VAIBOT_TIMEOUT_MS: '2000',

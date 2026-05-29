@@ -2,29 +2,36 @@
 /**
  * VAIBot Claude Code PostToolUse hook.
  *
- * Reads tool result from stdin (JSON), finds the matching run state from
- * pre-tool-use, and calls the VAIBot finalize endpoint to close the receipt.
+ * Reads the tool result from stdin (JSON), finds the matching run state saved
+ * by pre-tool-use, and finalizes through the local VAIBot guard's
+ * /v1/finalize/tool (which proves the finalize receipt) to close the run.
  *
  * Environment variables:
- *   VAIBOT_API_URL    — base URL of the VAIBot v2 API (default: https://api.vaibot.io)
- *   VAIBOT_API_KEY    — Bearer token for the governance API
- *   VAIBOT_TIMEOUT_MS — request timeout in ms (default: 10000)
+ *   VAIBOT_GUARD_BASE_URL — override the local guard URL (else discovered from the lock file)
+ *   VAIBOT_GUARD_TOKEN    — bearer token for the local guard
+ *   VAIBOT_TIMEOUT_MS     — request timeout in ms (default: 10000)
  */
 
 import { readFileSync, readdirSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { resolveCredentials, credsPath } from './lib/creds.mjs'
+import { readLock } from './lib/guard-bootstrap.mjs'
 
-// Credentials — shared with pre-tool-use.mjs via the env-namespaced store. The
-// pre-hook's auto-bootstrap writes the account's api_key for the resolved env;
-// the post-hook resolves the same env to finalize receipts the pre-hook created.
-// An explicit VAIBOT_API_KEY / VAIBOT_API_URL always wins (handled in resolver).
-const CREDS_FILE = credsPath()
-const resolved = resolveCredentials()
-const API_URL = resolved.apiBaseUrl
-const API_KEY = resolved.apiKey ?? ''
 const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
+
+// Resolve the running guard to finalize against. pre-tool-use already launched
+// it (lock written) by the time PostToolUse fires; honour the env override if set.
+function resolveGuard() {
+  const baseUrl = process.env.VAIBOT_GUARD_BASE_URL
+  if (baseUrl) {
+    try {
+      const u = new URL(baseUrl)
+      return { host: u.hostname, port: Number(u.port) || 39111, token: process.env.VAIBOT_GUARD_TOKEN || '' }
+    } catch { /* fall through */ }
+  }
+  const lock = readLock()
+  return lock && lock.port ? { host: lock.host, port: lock.port, token: lock.token } : null
+}
 
 const STATE_DIR = join(tmpdir(), 'vaibot-claudecode')
 const MAX_STATE_AGE_MS = 5 * 60 * 1000 // 5 minutes
@@ -98,53 +105,32 @@ async function main() {
 
   // Receipt exists and needs closing — having no API key here is a real problem,
   // not a silent skip. Warn so the user sees the receipt will be left open.
-  if (!API_KEY) {
+  // Direction A: finalize through the local guard (it proves the finalize
+  // receipt). The guard recovers the session from the runId's stored context.
+  // The 'ask' approval the user granted in Claude Code's native UI is captured
+  // by the finalize receipt; the guard's pending approval record self-expires.
+  const guard = resolveGuard()
+  if (!guard) {
     process.stderr.write(
-      `VAIBot [finalize]: no API key — receipt ${runState.run_id} left unfinalized. ` +
-      `Set VAIBOT_API_KEY or ensure ${CREDS_FILE} is readable.\n`
+      `VAIBot [finalize]: no local guard reachable — run ${runState.run_id} left unfinalized.\n`
     )
     process.exit(0)
   }
 
-  // PostToolUse firing after a `permissionDecision: 'ask'` means the user
-  // picked Yes in the native UI. Record the approval on the receipt chain
-  // before the normal finalize — without this the receipt's approval_status
-  // would stay `pending` forever even though execution proceeded.
-  if (runState.approval_required && runState.content_hash) {
-    try {
-      await fetch(`${API_URL}/v2/receipts/${encodeURIComponent(runState.content_hash)}/approve`, {
-        method: 'PATCH',
-        headers: {
-          'content-type': 'application/json',
-          authorization: `Bearer ${API_KEY}`,
-        },
-        signal: AbortSignal.timeout(TIMEOUT_MS),
-      })
-    } catch { /* best-effort — don't block finalize */ }
-  }
-
   const outcome = error ? 'blocked' : 'allowed'
-
-  // Only include optional result fields when we actually have values. Claude
-  // Code's PostToolUse hook input doesn't provide a duration for Bash calls,
-  // so `durationMs` is often null — omit the key entirely in that case.
-  const result = {}
+  const result = { outcome }
   if (typeof durationMs === 'number') result.duration_ms = durationMs
   if (error) result.error = String(error).slice(0, 2000)
-  const body = { outcome, ...(Object.keys(result).length > 0 ? { result } : {}) }
 
   try {
-    await fetch(`${API_URL}/v2/governance/finalize/${encodeURIComponent(runState.run_id)}`, {
+    await fetch(`http://${guard.host}:${guard.port}/v1/finalize/tool`, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${API_KEY}`,
-      },
-      body: JSON.stringify(body),
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${guard.token}` },
+      body: JSON.stringify({ sessionId: 'claude-code', runId: runState.run_id, result }),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     })
   } catch {
-    // Best-effort finalization — don't block the session
+    // Best-effort finalization — don't block the session.
   }
 
   process.exit(0)

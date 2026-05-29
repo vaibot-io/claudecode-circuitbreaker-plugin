@@ -4,8 +4,9 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-// Guards the vendored copies of the guard adapter modules. The Codex hooks run
-// as standalone node scripts and can't import @vaibot/shared at runtime, so
+// Guards the vendored copies of the guard adapter modules. The Claude Code
+// hooks run as standalone node scripts and can't import @vaibot/shared at
+// runtime, so
 // scripts/lib/{guard-bootstrap,guard-launch,guard-client}.mjs are verbatim
 // copies. These tests fail if a copy drifts from the canonical source.
 

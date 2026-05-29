@@ -58,6 +58,8 @@ function runHook({ apiUrl, mode = 'enforce', input }) {
         ...process.env,
         HOME: fakeHome,
         VAIBOT_API_URL: apiUrl,
+        VAIBOT_GUARD_BASE_URL: apiUrl,
+        VAIBOT_GUARD_TOKEN: 'test-guard-token',
         VAIBOT_API_KEY: 'test-key',
         VAIBOT_MODE: mode,
         VAIBOT_TIMEOUT_MS: '2000',
@@ -86,7 +88,7 @@ test('enforce + allow → permissionDecision: allow, no finalize call', async ()
   const cmd = uniqCmd('echo hi')
   const cwd = process.cwd()
   const server = await startMockServer((req) => {
-    if (req.url === '/v2/governance/decide') {
+    if (req.url === '/v1/decide/tool') {
       return {
         status: 200,
         body: {
@@ -115,11 +117,18 @@ test('enforce + allow → permissionDecision: allow, no finalize call', async ()
   } finally { await server.close() }
 })
 
-// Minimal decide-only handler for clarity in the ask tests below.
+// Decide-only handler: translate a V2-style fixture into the guard's
+// /v1/decide/tool shape (runId, risk, decision{decision,reason,approvalId}) so
+// the hook's decideViaGuard parses it. content_hash rides as the approvalId.
 function decideHandler(decisionBody) {
-  return (req) => req.url === '/v2/governance/decide'
-    ? { status: 200, body: { ok: true, ...decisionBody } }
-    : { status: 200, body: { ok: true } }
+  const inner = decisionBody.decision ?? {}
+  const body = {
+    ok: true,
+    runId: decisionBody.run_id,
+    risk: decisionBody.risk,
+    decision: { decision: inner.decision, reason: inner.reason, approvalId: decisionBody.content_hash },
+  }
+  return (req) => (req.url === '/v1/decide/tool' ? { status: 200, body } : { status: 200, body: { ok: true } })
 }
 
 function stateFilePath(toolUseId) {
@@ -181,7 +190,7 @@ test('approval_required → runState carries approval_required=true + content_ha
   }
 })
 
-test('enforce + deny → deny output, finalize POSTed, pending file cleared', async () => {
+test('enforce + deny → deny output, pending file cleared', async () => {
   const cmd = uniqCmd('rm -rf /tmp/customer-export')
   const cwd = process.cwd()
   // Seed a pending file to verify it gets cleared
@@ -189,7 +198,7 @@ test('enforce + deny → deny output, finalize POSTed, pending file cleared', as
   writeFileSync(pendingPath('Bash', cmd, cwd), JSON.stringify({ content_hash: 'sha256:stale', ts: 0 }))
 
   const server = await startMockServer((req) => {
-    if (req.url === '/v2/governance/decide') {
+    if (req.url === '/v1/decide/tool') {
       return {
         status: 200,
         body: {
@@ -216,10 +225,8 @@ test('enforce + deny → deny output, finalize POSTed, pending file cleared', as
     assert.equal(res.code, 0)
     const out = JSON.parse(res.stdout)
     assert.equal(out.hookSpecificOutput.permissionDecision, 'deny')
-    const finalizeCalls = server.requests.filter((r) => r.url.startsWith('/v2/governance/finalize/'))
-    assert.equal(finalizeCalls.length, 1)
-    assert.equal(finalizeCalls[0].body.outcome, 'blocked')
-
+    // Pre-hook no longer finalizes on deny — the guard's decide receipt records
+    // the verdict; finalize happens only for executed tools via post-tool-use.
     assert.ok(!existsSync(pendingPath('Bash', cmd, cwd)), 'pending file cleared on deny')
   } finally { await server.close() }
 })
@@ -228,7 +235,7 @@ test('finalize network error does not block deny output', async () => {
   const cmd = uniqCmd('rm -rf /tmp/abc')
   const cwd = process.cwd()
   const server = await startMockServer((req) => {
-    if (req.url === '/v2/governance/decide') {
+    if (req.url === '/v1/decide/tool') {
       return {
         status: 200,
         body: {
@@ -271,7 +278,7 @@ function seedStaleAsk(contentHash, toolUseId = 'tu_old') {
   return path
 }
 
-test('sweep: stale approval_required runState → PATCH /deny on next PreToolUse', async () => {
+test('sweep: stale approval_required runState is cleaned locally (no network /deny)', async () => {
   const stalePath = seedStaleAsk('sha256:stale')
   const server = await startMockServer(decideHandler({
     decision: { decision: 'allow' }, shadow_decision: { decision: 'allow' },
@@ -282,10 +289,11 @@ test('sweep: stale approval_required runState → PATCH /deny on next PreToolUse
       tool_name: 'Bash', tool_input: { command: uniqCmd('echo hi') },
       session_id: 's', tool_use_id: 'tu_new',
     }})
+    // Guard approvals self-expire server-side; the sweep only removes stale
+    // local run-state — no /deny PATCH is issued.
     const denies = server.requests.filter((r) => r.method === 'PATCH' && r.url.endsWith('/deny'))
-    assert.equal(denies.length, 1)
-    assert.ok(denies[0].url.includes('sha256%3Astale'))
-    assert.ok(!existsSync(stalePath))
+    assert.equal(denies.length, 0)
+    assert.ok(!existsSync(stalePath), 'stale ask-in-flight run-state cleaned')
   } finally {
     await server.close()
     try { rmSync(stalePath) } catch {}
@@ -300,9 +308,9 @@ test('retry with pending pointer: server returns previously_approved=true → al
   writeFileSync(pendingPath('Bash', cmd, cwd), JSON.stringify({ content_hash: 'sha256:appr', ts: Date.now() }))
 
   const server = await startMockServer((req) => {
-    if (req.url === '/v2/governance/decide') {
+    if (req.url === '/v1/decide/tool') {
       // Verify the plugin sent the pointer
-      assert.equal(req.body.approved_content_hash, 'sha256:appr')
+      assert.equal(req.body.approval?.approvalId, 'sha256:appr')
       return {
         status: 200,
         body: {
@@ -337,7 +345,7 @@ test('allow + claimed:false → stderr nudge fires on first tool call of session
   try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
 
   const server = await startMockServer((req) => {
-    if (req.url === '/v2/governance/decide') {
+    if (req.url === '/v1/decide/tool') {
       return {
         status: 200,
         body: {
@@ -388,7 +396,7 @@ test('approval_required + claimed:false → stderr nudge written + marker create
   try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
 
   const server = await startMockServer((req) => {
-    if (req.url === '/v2/governance/decide') {
+    if (req.url === '/v1/decide/tool') {
       return {
         status: 200,
         body: {
@@ -442,7 +450,7 @@ test('approval_required + claimed:true → no nudge', async () => {
   try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
 
   const server = await startMockServer((req) => {
-    if (req.url === '/v2/governance/decide') {
+    if (req.url === '/v1/decide/tool') {
       return {
         status: 200,
         body: {
@@ -493,7 +501,7 @@ test('approval_required + nudge marker already present → no second nudge', asy
 
   let meCalls = 0
   const server = await startMockServer((req) => {
-    if (req.url === '/v2/governance/decide') {
+    if (req.url === '/v1/decide/tool') {
       return {
         status: 200,
         body: {
@@ -562,7 +570,7 @@ test('bootstrap fingerprint is identical across different cwds (no cwd in formul
         },
       }
     }
-    if (req.url === '/v2/governance/decide') {
+    if (req.url === '/v1/decide/tool') {
       return {
         status: 200,
         body: {
@@ -590,6 +598,8 @@ test('bootstrap fingerprint is identical across different cwds (no cwd in formul
           ...process.env,
           HOME: fakeHome,
           VAIBOT_API_URL: server.url,
+          VAIBOT_GUARD_BASE_URL: server.url,
+          VAIBOT_GUARD_TOKEN: 'test-guard-token',
           VAIBOT_API_KEY: '',
           VAIBOT_MODE: 'enforce',
           VAIBOT_TIMEOUT_MS: '2000',
