@@ -17,7 +17,7 @@
 import { readFileSync, readdirSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { resolveCredentials } from './lib/creds.mjs'
+import { resolveCredentials } from '@vaibot/guard/creds'
 
 const resolved = resolveCredentials()
 const API_URL = resolved.apiBaseUrl

@@ -24,16 +24,16 @@ import { createHash } from 'node:crypto'
 import { writeFileSync, readFileSync, readdirSync, mkdirSync, existsSync, unlinkSync, chmodSync, renameSync } from 'node:fs'
 import { tmpdir, hostname, homedir, userInfo } from 'node:os'
 import { join } from 'node:path'
-import { resolveCredentials, saveCredsForEnv, migrateFileIfNeeded, credsPath } from './lib/creds.mjs'
+import { resolveCredentials, saveCredsForEnv, migrateFileIfNeeded, credsPath } from '@vaibot/guard/creds'
 import {
   CircuitBreaker,
   DEFAULT_FAILURE_THRESHOLD,
   DEFAULT_WINDOW_MS,
   DEFAULT_COOLDOWN_MS,
-} from './lib/circuit-breaker.mjs'
-import { classify, VERDICT } from './lib/classifier.mjs'
-import { ensureGuardDefault } from './lib/guard-launch.mjs'
-import { decideViaGuard } from './lib/guard-client.mjs'
+} from '@vaibot/guard/circuit-breaker'
+import { classify, VERDICT } from '@vaibot/guard/classifier'
+import { ensureGuardDefault } from '@vaibot/guard/guard-launch'
+import { decideViaGuard } from '@vaibot/guard/guard-client'
 import { createRequire } from 'node:module'
 
 const nodeRequire = createRequire(import.meta.url)
