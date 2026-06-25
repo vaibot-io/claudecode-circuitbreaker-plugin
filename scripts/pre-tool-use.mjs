@@ -439,8 +439,11 @@ async function main() {
   try {
     hookInput = JSON.parse(raw)
   } catch {
-    // Can't parse input — fail open to avoid blocking Claude Code
-    process.exit(0)
+    // Fail-closed: an unparseable tool call can't be governed → deny in enforce.
+    // Observe / FAIL_OPEN keep the old non-blocking behavior.
+    if (FAIL_OPEN || MODE === 'observe') process.exit(0)
+    process.stderr.write('VAIBot: could not parse hook input — denying (fail-closed)\n')
+    process.exit(2)
   }
 
   const toolName = hookInput.tool_name ?? hookInput.toolName ?? 'unknown'
@@ -460,12 +463,15 @@ async function main() {
       if (bootstrapKey) {
         API_KEY = bootstrapKey
       } else {
-        // Bootstrap returned no key (already provisioned but lost) — fail open
-        process.exit(0)
+        // Fail-closed: no usable API key → can't govern → deny in enforce.
+        if (FAIL_OPEN || MODE === 'observe') process.exit(0)
+        process.stderr.write('VAIBot: no API key (run `vaibot login`) — denying (fail-closed)\n')
+        process.exit(2)
       }
     } catch (err) {
       process.stderr.write(`VAIBot [bootstrap]: ${err.message}\n`)
-      process.exit(0) // fail open on bootstrap failure
+      if (FAIL_OPEN || MODE === 'observe') process.exit(0)
+      process.exit(2) // fail-closed on bootstrap failure
     }
   }
 
@@ -588,12 +594,24 @@ async function main() {
       ts: Date.now(),
     })
 
-    // In observe mode, always allow but log the raw policy verdict
+    // In observe mode, log the raw policy verdict and allow — EXCEPT the
+    // un-overridable catastrophic floor (Tier-0), which blocks even in observe.
     if (MODE === 'observe') {
       if (rawDecision && rawDecision !== 'allow') {
         process.stderr.write(
           `VAIBot [observe]: ${toolName} would be ${rawDecision} — ${rawReason}\n`
         )
+      }
+      if (rawDecision === 'deny' && result.floor === true) {
+        const output = {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: `VAIBot blocked (catastrophic floor, enforced even in observe) — ${rawReason}`,
+          },
+        }
+        process.stdout.write(JSON.stringify(output))
+        process.exit(0)
       }
       process.exit(0)
     }
@@ -657,8 +675,11 @@ async function main() {
       process.exit(0)
     }
 
-    // Unknown decision — fail open
-    process.exit(0)
+    // Unknown decision — fail-closed: deny an unrecognized verdict (we're past
+    // the observe gate here, so only an explicit FAIL_OPEN keeps it non-blocking).
+    if (FAIL_OPEN) process.exit(0)
+    process.stderr.write('VAIBot: unrecognized guard decision — denying (fail-closed)\n')
+    process.exit(2)
 
   } catch (err) {
     // Breaker accounting: network errors / timeouts are transient.
