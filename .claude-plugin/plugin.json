@@ -1,14 +1,20 @@
 {
   "name": "vaibot-governance",
-  "description": "VAIBot AI agent governance — intercepts tool calls, classifies risk, enforces policy, and creates tamper-evident audit receipts with on-chain provenance anchoring.",
-  "version": "0.2.2",
+  "description": "VAIBot AI agent governance \u2014 intercepts tool calls, classifies risk, enforces policy, and creates tamper-evident audit receipts with on-chain provenance anchoring.",
+  "version": "0.2.4",
   "author": {
     "name": "Campbell Labs LLC"
   },
   "license": "MIT",
   "homepage": "https://www.vaibot.io",
   "repository": "https://github.com/vaibot-io/claudecode-circuitbreaker-plugin",
-  "keywords": ["claude-code", "governance", "circuit-breaker", "vaibot", "hooks", "audit", "provenance"],
-  "hooks": "../hooks/hooks.json",
-  "mcpServers": "../.mcp.json"
+  "keywords": [
+    "claude-code",
+    "governance",
+    "circuit-breaker",
+    "vaibot",
+    "hooks",
+    "audit",
+    "provenance"
+  ]
 }

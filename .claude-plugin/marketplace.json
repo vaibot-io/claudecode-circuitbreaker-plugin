@@ -1,20 +1,20 @@
 {
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "vaibot-claudecode",
-  "interface": {
-    "displayName": "VAIbot Governance — Claude Code"
+  "description": "VAIBot governance for Claude Code — classifies tool-call risk, enforces policy, and writes tamper-evident audit receipts with on-chain provenance.",
+  "owner": {
+    "name": "Campbell Labs LLC",
+    "email": "support@vaibot.io"
   },
   "plugins": [
     {
       "name": "vaibot-governance",
-      "source": {
-        "source": "local",
-        "path": "./"
+      "description": "Intercepts tool calls, classifies risk, enforces policy (allow / ask / deny), and creates tamper-evident audit receipts anchored on-chain.",
+      "author": {
+        "name": "Campbell Labs LLC"
       },
-      "policy": {
-        "installation": "AVAILABLE",
-        "authentication": "ON_INSTALL"
-      },
-      "category": "Security"
+      "category": "security",
+      "source": "./"
     }
   ]
 }
