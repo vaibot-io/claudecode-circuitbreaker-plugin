@@ -24,16 +24,16 @@ import { createHash } from 'node:crypto'
 import { writeFileSync, readFileSync, readdirSync, mkdirSync, existsSync, unlinkSync, chmodSync, renameSync } from 'node:fs'
 import { tmpdir, hostname, homedir, userInfo } from 'node:os'
 import { join } from 'node:path'
-import { resolveCredentials, saveCredsForEnv, migrateFileIfNeeded, credsPath } from '@vaibot/guard/creds'
+import { resolveCredentials, saveCredsForEnv, migrateFileIfNeeded, credsPath } from '../vendor/vaibot-guard/scripts/lib/creds.mjs'
 import {
   CircuitBreaker,
   DEFAULT_FAILURE_THRESHOLD,
   DEFAULT_WINDOW_MS,
   DEFAULT_COOLDOWN_MS,
-} from '@vaibot/guard/circuit-breaker'
-import { classify, VERDICT } from '@vaibot/guard/classifier'
-import { ensureGuardDefault } from '@vaibot/guard/guard-launch'
-import { decideViaGuard } from '@vaibot/guard/guard-client'
+} from '../vendor/vaibot-guard/scripts/lib/circuit-breaker.mjs'
+import { classify, VERDICT } from '../vendor/vaibot-guard/scripts/classifier.mjs'
+import { ensureGuardDefault } from '../vendor/vaibot-guard/scripts/lib/guard-launch.mjs'
+import { decideViaGuard } from '../vendor/vaibot-guard/scripts/lib/guard-client.mjs'
 import { createRequire } from 'node:module'
 
 const nodeRequire = createRequire(import.meta.url)
@@ -417,7 +417,7 @@ async function resolveGuardTarget(cwd) {
   }
   let guardScript
   try {
-    guardScript = nodeRequire.resolve('@vaibot/guard/service')
+    guardScript = nodeRequire.resolve('../vendor/vaibot-guard/scripts/vaibot-guard-service.mjs')
   } catch {
     return null
   }

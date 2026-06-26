@@ -15,7 +15,7 @@
 import { readFileSync, readdirSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { readLock } from '@vaibot/guard/guard-bootstrap'
+import { readLock } from '../vendor/vaibot-guard/scripts/lib/guard-bootstrap.mjs'
 
 const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
 

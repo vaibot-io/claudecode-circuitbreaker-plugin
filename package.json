@@ -4,7 +4,7 @@
   "description": "VAIBot governance plugin for Claude Code — intercepts tool calls, classifies risk, enforces policy, and creates tamper-evident audit receipts with on-chain provenance anchoring.",
   "license": "MIT",
   "type": "module",
-  "dependencies": {
+  "devDependencies": {
     "@vaibot/guard": "workspace:*"
   },
   "homepage": "https://www.vaibot.io",
@@ -25,7 +25,8 @@
     "hooks",
     "audit",
     "provenance",
-    "ai-agents"
+    "ai-agents",
+    "guardrails"
   ],
   "files": [
     ".claude-plugin/",
@@ -33,6 +34,7 @@
     "hooks/",
     "scripts/",
     "skills/",
+    "vendor/",
     "README.md",
     "LICENSE"
   ],

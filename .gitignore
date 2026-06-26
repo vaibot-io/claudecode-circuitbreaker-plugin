@@ -1,0 +1,7 @@
+# Never commit node_modules — Claude Code copies plugin files into its cache
+# (~/.claude/plugins/cache) and runs no npm install, so the pnpm workspace symlink
+# at node_modules/@vaibot/guard must never reach the distributed repo. The guard
+# ships as real files under vendor/ instead.
+node_modules/
+*.tgz
+.vaibot-guard/
