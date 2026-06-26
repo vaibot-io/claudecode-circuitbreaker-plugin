@@ -1296,6 +1296,10 @@ function appendAudit(event) {
   const safeEvent = { ...event };
   if (safeEvent.intent) safeEvent.intent = redactIntent(safeEvent.intent);
   if (typeof safeEvent.workspaceDir === "string") safeEvent.workspaceDir = collapseHome(safeEvent.workspaceDir);
+  // Top-level cmd/args on exec leaves carry raw paths (and secrets) too — redact +
+  // collapse them, not just the intent copy.
+  if (typeof safeEvent.cmd === "string") safeEvent.cmd = redactString(safeEvent.cmd);
+  if (Array.isArray(safeEvent.args)) safeEvent.args = safeEvent.args.map(redactString);
   const fullEvent = { ...safeEvent, prevHash };
   const line = stableStringify(fullEvent);
   const h = sha256(line);
