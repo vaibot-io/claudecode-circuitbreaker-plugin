@@ -920,7 +920,7 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
 
   const toolName = String(intent?.toolName || intent?.tool || intent?.cmd?.split(" ")[0] || "unknown");
   const command = String(intent?.cmd || intent?.command || toolName).slice(0, 500);
-  const cwd = String(intent?.workspaceDir || intent?.cwd || "/");
+  const cwd = collapseHome(String(intent?.workspaceDir || intent?.cwd || "/"));
 
   const guardDecision = String(decision?.decision || "deny");
   // Map guard decision names to governance receipt decision names
@@ -1230,6 +1230,19 @@ function createCheckpointIfNeeded(sessionId, reason) {
   return checkpoint;
 }
 
+// Replace the user's home-dir prefix with "~" so persisted/proven strings (cwd,
+// workspaceDir, paths inside commands) don't leak the OS username (PII). Best-effort:
+// a no-op when HOME is unset, and it only rewrites `$HOME/...` occurrences (never a
+// bare substring), so it can't corrupt unrelated text. NOTE: this strips the username
+// only — deeper path PII (client/person names inside project dirs) is not handled here.
+function collapseHome(p) {
+  const s = String(p ?? "");
+  const home = process.env.HOME || "";
+  if (!home || !s) return s;
+  if (s === home) return "~";
+  return s.split(home + "/").join("~/");
+}
+
 function redactString(s) {
   let out = String(s);
   for (const pat of POLICY.redactPatterns) {
@@ -1239,7 +1252,7 @@ function redactString(s) {
       // ignore bad patterns
     }
   }
-  return out;
+  return collapseHome(out);
 }
 
 function redactIntent(intent) {
@@ -1266,6 +1279,10 @@ function redactIntent(intent) {
     clone.network.destinations = clone.network.destinations.map((d) => redactString(d));
   }
 
+  // Collapse home-dir paths so cwd/workspace don't leak the OS username (PII).
+  if (typeof clone.cwd === "string") clone.cwd = collapseHome(clone.cwd);
+  if (typeof clone.workspaceDir === "string") clone.workspaceDir = collapseHome(clone.workspaceDir);
+
   return clone;
 }
 
@@ -1278,6 +1295,7 @@ function appendAudit(event) {
   // Redact sensitive strings before persistence/proving.
   const safeEvent = { ...event };
   if (safeEvent.intent) safeEvent.intent = redactIntent(safeEvent.intent);
+  if (typeof safeEvent.workspaceDir === "string") safeEvent.workspaceDir = collapseHome(safeEvent.workspaceDir);
   const fullEvent = { ...safeEvent, prevHash };
   const line = stableStringify(fullEvent);
   const h = sha256(line);
@@ -1631,6 +1649,7 @@ const server = http.createServer(async (req, res) => {
         runId,
         toolName,
         params: redactIntent(params),
+        workspaceDir,
         risk,
         receiptTier,
         decision,

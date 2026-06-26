@@ -2,7 +2,7 @@
 
 ## `vaibot-guard/` — a committed, real-file copy of `@vaibot/guard`
 
-**Current version: `1.0.1`** (keep in lockstep with the version the `vaibot` CLI
+**Current version: `1.0.2`** (keep in lockstep with the version the `vaibot` CLI
 installs globally and with the codex/openclaw plugin vendors).
 
 ### Why this is vendored

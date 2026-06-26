@@ -1,7 +1,7 @@
 {
   "name": "@vaibot/guard",
-  "version": "1.0.1",
-  "description": "VAIBot Guard — local policy enforcement + tamper-evident audit daemon for AI agent tool calls. The universal decision authority the codex/claudecode/openclaw plugins route through.",
+  "version": "1.0.2",
+  "description": "VAIBot Guard \u2014 local policy enforcement + tamper-evident audit daemon for AI agent tool calls. The universal decision authority the codex/claudecode/openclaw plugins route through.",
   "type": "module",
   "license": "MIT",
   "homepage": "https://www.vaibot.io",
