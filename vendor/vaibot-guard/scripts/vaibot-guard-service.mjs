@@ -17,6 +17,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { classify } from "./classifier.mjs";
 import { loadPolicyBundle, effectivePolicy, computeBundleHash, verifyBundle } from "./policy-bundle.mjs";
+import { pickPolicyPubkey } from "./pinned-keys.mjs";
 import { writeLock, readLock, LOCK_FILE } from "./lib/guard-bootstrap.mjs";
 import { loadGuardEnvFile } from "./lib/env-file.mjs";
 
@@ -94,7 +95,13 @@ const FILE_MUTATION_DENIED_PATH_ACTION = POLICY.fileMutationDeniedPathAction || 
 // optional classifier-ruleset overrides. Fail-closed: a missing / invalid /
 // expired / unsigned bundle falls back to the safe built-in classifier defaults
 // and an empty denylist — it never relaxes enforcement.
-const POLICY_PUBKEY = process.env.VAIBOT_POLICY_PUBKEY || "";
+//
+// The pubkey is resolved via pinned-keys.mjs so end users don't have to set
+// VAIBOT_POLICY_PUBKEY themselves: the staging + prod keys ship inside the
+// published package (a staging guard is picked up from VAIBOT_ENV or the pinned
+// VAIBOT_POLICY_URL). VAIBOT_POLICY_PUBKEY remains an explicit override for
+// local dev / CI / self-hosted setups.
+const POLICY_PUBKEY = pickPolicyPubkey();
 // When fetching from the control plane we cache to a WRITABLE path (LOG_DIR)
 // rather than the read-only skill references dir.
 const POLICY_BUNDLE_PATH =
