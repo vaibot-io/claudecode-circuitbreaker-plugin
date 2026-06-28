@@ -547,6 +547,15 @@ async function main() {
     breaker.recordSuccess()
     saveBreakerSnapshot(breaker.snapshot())
 
+    // The guard publishes the server-resolved account mode; it is authoritative on
+    // this ONLINE path (the guard answered). VAIBOT_MODE stays the fallback only
+    // when the guard is older/silent (field absent) — and on the offline/breaker
+    // paths above, where there is no guard answer at all.
+    const effectiveMode =
+      result.effective_mode === 'observe' || result.effective_mode === 'enforce'
+        ? result.effective_mode
+        : MODE
+
     // Adapt the guard's decision into the shape the downstream consumes
     // (approve → approval_required; the approvalId rides as content_hash).
     const guardDecision = result.decision === 'approve' ? 'approval_required' : result.decision
@@ -596,7 +605,8 @@ async function main() {
 
     // In observe mode, log the raw policy verdict and allow — EXCEPT the
     // un-overridable catastrophic floor (Tier-0), which blocks even in observe.
-    if (MODE === 'observe') {
+    // Uses the guard-resolved effectiveMode (not the local VAIBOT_MODE) here.
+    if (effectiveMode === 'observe') {
       if (rawDecision && rawDecision !== 'allow') {
         process.stderr.write(
           `VAIBot [observe]: ${toolName} would be ${rawDecision} — ${rawReason}\n`

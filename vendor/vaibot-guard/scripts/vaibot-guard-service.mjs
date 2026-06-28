@@ -250,6 +250,71 @@ const VAIBOT_API_URL = process.env.VAIBOT_API_URL || ""; // e.g. https://provena
 const VAIBOT_API_KEY = process.env.VAIBOT_API_KEY || ""; // bearer token
 const VAIBOT_PROVE_MODEL = process.env.VAIBOT_PROVE_MODEL || "vaibot-guard"; // /api/prove requires model
 
+// ---- Effective enforce/observe mode (guard = single source of truth) ---------
+// The guard does NOT apply observe/enforce itself — it returns raw decisions plus
+// the un-overridable Tier-0 `floor`. It RESOLVES the account mode from the control
+// plane and PUBLISHES it (in every decide response, in guard.json, and on /health)
+// so the plugins/CLI/gateway all read ONE consistent value instead of each fetching
+// it (that would be N enforcement surfaces). Source of truth: GET /v2/accounts/me
+// `enforcement.effective_mode` (api-key auth). Until the server answers we fall back
+// to VAIBOT_MODE env, else strict 'enforce'. FAIL-STATIC: a transient poll failure
+// or a malformed value keeps the last good mode — a blip must never silently
+// downgrade enforce→observe. `floor:true` still blocks in EVERY mode (client-side).
+function normalizeMode(m) {
+  return String(m || "").toLowerCase() === "observe" ? "observe" : "enforce";
+}
+let EFFECTIVE_MODE = normalizeMode(process.env.VAIBOT_MODE || "enforce");
+
+// Governance API base (where /v2/accounts/me lives), derived from the policy URL:
+// https://staging-api.vaibot.io/v2/policy → https://staging-api.vaibot.io
+function governanceBaseUrl() {
+  const u = (process.env.VAIBOT_POLICY_URL || "").trim();
+  if (!u) return "";
+  return u.replace(/\/v2\/policy\/?$/i, "").replace(/\/+$/, "");
+}
+
+// Re-stamp guard.json with the current mode (only if WE still own the lock) so
+// offline readers (CLI, gateway) see a live value without issuing a decide call.
+function republishMode() {
+  try {
+    const l = readLock();
+    if (l && l.pid === process.pid) writeLock({ ...l, effective_mode: EFFECTIVE_MODE });
+  } catch {
+    /* best-effort: decide responses + /health stay authoritative regardless */
+  }
+}
+
+async function refreshEffectiveMode() {
+  const base = governanceBaseUrl();
+  if (!base || !VAIBOT_API_KEY) return; // no control plane / no creds → keep current (fail-static)
+  try {
+    const res = await fetch(`${base}/v2/accounts/me`, {
+      headers: { authorization: `Bearer ${VAIBOT_API_KEY}` },
+      signal: AbortSignal.timeout(Number(process.env.VAIBOT_MODE_FETCH_TIMEOUT_MS || 3000)),
+    });
+    if (!res.ok) return; // transient/auth blip → fail-static
+    const data = await res.json().catch(() => null);
+    const m = data?.enforcement?.effective_mode;
+    if (m !== "observe" && m !== "enforce") return; // malformed/absent → fail-static
+    if (m !== EFFECTIVE_MODE) {
+      EFFECTIVE_MODE = m;
+      republishMode();
+      console.error(`[vaibot-guard] effective mode = '${m}' (control plane).`);
+    }
+  } catch {
+    /* fail-static: keep the last good EFFECTIVE_MODE */
+  }
+}
+
+// Poll the control plane for the account mode on its own timer (non-blocking at
+// boot — guard.json starts on the fail-safe default and is re-stamped within
+// seconds when the server answers).
+if (governanceBaseUrl() && VAIBOT_API_KEY) {
+  refreshEffectiveMode().catch(() => {});
+  const modeEveryMs = Math.max(1000, Number(process.env.VAIBOT_MODE_REFRESH_MS || 300_000));
+  setInterval(() => { refreshEffectiveMode().catch(() => {}); }, modeEveryMs).unref();
+}
+
 // Persist run context so finalize receipts can include intent+decision+result even across service restarts.
 // Stored under VAIBOT_GUARD_LOG_DIR as: runctx/<runId>.json
 const RUNCTX_DIR = path.join(LOG_DIR, "runctx");
@@ -1344,7 +1409,7 @@ function appendAudit(event) {
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/health") {
-      return json(res, 200, { ok: true, service: "vaibot-guard", version: GUARD_VERSION, instanceId: INSTANCE_ID, ts: nowIso() });
+      return json(res, 200, { ok: true, service: "vaibot-guard", version: GUARD_VERSION, instanceId: INSTANCE_ID, ts: nowIso(), effective_mode: EFFECTIVE_MODE });
     }
 
     // Read-only view of the active signed policy + provenance (F-155). Like
@@ -1566,7 +1631,7 @@ const server = http.createServer(async (req, res) => {
       // Store context for finalize (persisted).
       writeRunContext(runId, { sessionId, risk, receiptTier, intent, decision, precheckAudit: audit, ts: nowIso(), policyVersion: POLICY.version });
 
-      return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove });
+      return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove, effective_mode: EFFECTIVE_MODE });
     }
 
     if (req.method === "POST" && req.url === "/v1/decide/tool") {
@@ -1723,7 +1788,7 @@ const server = http.createServer(async (req, res) => {
         policyVersion: POLICY.version,
       });
 
-      return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove });
+      return json(res, 200, { ok: true, runId, risk, receiptTier, decision, audit, prove, effective_mode: EFFECTIVE_MODE });
     }
 
     if (req.method === "POST" && req.url === "/v1/finalize/tool") {
@@ -1945,6 +2010,7 @@ server.listen(PORT, HOST, () => {
       pid: process.pid,
       instanceId: INSTANCE_ID,
       startedAt: Date.now(),
+      effective_mode: EFFECTIVE_MODE,
     });
   } catch (e) {
     // eslint-disable-next-line no-console

@@ -14,7 +14,8 @@
  * @param {{sessionId?:string, toolName:string, params?:object, workspaceDir?:string, cwd?:string, approvalId?:string}} request
  * @param {{fetchImpl?:typeof fetch, timeoutMs?:number}} [opts]
  * @returns {Promise<{ok:boolean, unreachable?:boolean, status?:number, error?:unknown,
- *   decision?:'allow'|'deny'|'approve', reason?:string, approvalId?:string|null, runId?:string|null, risk?:any, raw?:any}>}
+ *   decision?:'allow'|'deny'|'approve', reason?:string, approvalId?:string|null, floor?:boolean,
+ *   effective_mode?:'observe'|'enforce'|null, runId?:string|null, risk?:any, raw?:any}>}
  */
 export async function decideViaGuard(guard, request, opts = {}) {
   const { fetchImpl = fetch, timeoutMs = 10000 } = opts
@@ -61,6 +62,9 @@ export async function decideViaGuard(guard, request, opts = {}) {
     reason: inner?.reason ?? 'malformed guard decision',
     approvalId: inner?.approvalId ?? null,
     floor: inner?.floor === true, // un-overridable catastrophic floor (Tier-0)
+    // Guard-published account mode (single source of truth). null when the guard
+    // is older / silent → caller falls back to its local VAIBOT_MODE / cfg.mode.
+    effective_mode: data?.effective_mode === 'observe' || data?.effective_mode === 'enforce' ? data.effective_mode : null,
     runId: data?.runId ?? null,
     risk: data?.risk ?? null,
     raw: data,
