@@ -43,11 +43,12 @@ const HOST = process.env.VAIBOT_GUARD_HOST || "127.0.0.1";
 // — there is no standalone VAIBOT_API_URL that could pair a staging key with a prod
 // endpoint (the bug this fixes). Explicit/legacy env overrides are still honored:
 //   VAIBOT_API_KEY        → bearer (else the env's stored key)
-//   VAIBOT_GOVERNANCE_URL → V2 base (policy / mode / decide / receipts); deprecated
-//                           VAIBOT_API_URL aliases this (legacy V2 base — matches the
-//                           CLI + resolveCredentials, so /prove never mis-anchors to V2)
+//   VAIBOT_GOVERNANCE_URL → V2 base (policy / mode / decide / receipts)
 //   VAIBOT_PROVENANCE_URL → V1 base (/prove)
 //   VAIBOT_POLICY_URL     → policy feed (else derived as {governance}/v2/policy)
+// Deprecated VAIBOT_API_URL overrides NEITHER base — it only drives env inference
+// (resolveEnv). It's too overloaded to alias safely: the CLI used it as the V2 base,
+// the old guard used it as the /prove base. Redirects need the explicit per-API vars.
 const CREDS_STORE = loadStore();
 const CREDS_ENV = resolveEnv({ store: CREDS_STORE });
 const VAIBOT_API_KEY =
@@ -59,7 +60,7 @@ const VAIBOT_API_KEY =
 // dropped unless VAIBOT_ALLOW_URL_OVERRIDE is set; a flag-enabled prod override is
 // "provisional" until the poll confirms admin, then a non-admin's override is revoked.
 const ALLOW_URL_OVERRIDE = urlOverrideAllowed(process.env);
-const GOV_OVERRIDE_REQ = process.env.VAIBOT_GOVERNANCE_URL || process.env.VAIBOT_API_URL || "";
+const GOV_OVERRIDE_REQ = process.env.VAIBOT_GOVERNANCE_URL || "";
 const PROV_OVERRIDE_REQ = process.env.VAIBOT_PROVENANCE_URL || "";
 const CANONICAL_GOVERNANCE_BASE = governanceBaseForEnv(CREDS_STORE, CREDS_ENV, null);
 // Flag-gated overrides (null when a prod override lacks VAIBOT_ALLOW_URL_OVERRIDE).
@@ -75,7 +76,7 @@ let PROD_OVERRIDE_PENDING = IS_PROD && !!(GOV_OVERRIDE || PROV_OVERRIDE);
 if (IS_PROD) {
   for (const [label, req] of [
     ["VAIBOT_GOVERNANCE_URL", GOV_OVERRIDE_REQ],
-    ["VAIBOT_PROVENANCE_URL/VAIBOT_API_URL", PROV_OVERRIDE_REQ],
+    ["VAIBOT_PROVENANCE_URL", PROV_OVERRIDE_REQ],
   ]) {
     if (!req) continue;
     if (!ALLOW_URL_OVERRIDE)

@@ -311,7 +311,8 @@ export function migrateFileIfNeeded(opts = {}) {
 //   { env, apiBaseUrl, apiKey, walletAddress, keyMismatch }
 //
 // - env:          production | staging (resolveEnv precedence)
-// - apiBaseUrl:   VAIBOT_API_URL override, else the env's canonical base URL
+// - apiBaseUrl:   V2 governance base (VAIBOT_GOVERNANCE_URL override → slot → canonical)
+// - provenanceBaseUrl: V1 provenance base (VAIBOT_PROVENANCE_URL override → slot → canonical)
 // - apiKey:       VAIBOT_API_KEY override, else the stored key for env.
 //                 null when the only candidate fails the prefix guard.
 // - walletAddress:stored public address for env (display only), or null
@@ -322,15 +323,17 @@ export function resolveCredentials(opts = {}) {
   const env = opts.env ?? process.env
   const store = opts.store ?? loadStore(opts)
   const envName = resolveEnv({ ...opts, env, store })
-  // V2 governance: VAIBOT_GOVERNANCE_URL (new) → legacy VAIBOT_API_URL → stored slot
-  // → canonical. V1 provenance: VAIBOT_PROVENANCE_URL → stored slot → canonical.
+  // V2 governance: VAIBOT_GOVERNANCE_URL → stored slot → canonical.
+  // V1 provenance: VAIBOT_PROVENANCE_URL → stored slot → canonical.
+  // Deprecated VAIBOT_API_URL overrides NEITHER base (env inference only) — it's too
+  // overloaded (CLI's V2 base vs the guard's /prove base) to alias safely.
   // §5 flag-gate applied HERE (mirrors Rust resolve_credentials): a PRODUCTION
   // override is suppressed unless VAIBOT_ALLOW_URL_OVERRIDE is set, so every consumer
   // of resolveCredentials — including the plugin hooks, which have no preflight —
   // gets the unbypassable safe default and can never send a prod bearer to an
   // env-injected host. The admin half is layered by callers that can do a /me check.
   const allow = urlOverrideAllowed(env)
-  const govOverride = gateUrlOverride(envName, env.VAIBOT_GOVERNANCE_URL ?? env.VAIBOT_API_URL, allow)
+  const govOverride = gateUrlOverride(envName, env.VAIBOT_GOVERNANCE_URL, allow)
   const provOverride = gateUrlOverride(envName, env.VAIBOT_PROVENANCE_URL, allow)
   const apiBaseUrl = governanceBaseForEnv(store, envName, govOverride)
   const provenanceBaseUrl = provenanceBaseForEnv(store, envName, provOverride)
