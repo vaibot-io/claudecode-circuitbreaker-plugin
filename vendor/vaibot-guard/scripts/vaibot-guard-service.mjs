@@ -386,10 +386,10 @@ async function refreshEffectiveMode() {
 // seconds when the server answers).
 if (CANONICAL_GOVERNANCE_BASE && VAIBOT_API_KEY) {
   refreshEffectiveMode().catch(() => {});
-  // 60s default (was 5min): a governance mode change should take effect within ~1min
-  // without a manual `vaibot mode show` refresh. The /me GET is small (~0.7s). Override
-  // with VAIBOT_MODE_REFRESH_MS.
-  const modeEveryMs = Math.max(1000, Number(process.env.VAIBOT_MODE_REFRESH_MS || 60_000));
+  // 5min default: enforce/observe changes are human-initiated, so the background poll is
+  // only a safety net — for immediacy use `vaibot mode show` (↵ forces a re-poll) or
+  // POST /v1/mode/refresh. Override with VAIBOT_MODE_REFRESH_MS.
+  const modeEveryMs = Math.max(1000, Number(process.env.VAIBOT_MODE_REFRESH_MS || 300_000));
   setInterval(() => { refreshEffectiveMode().catch(() => {}); }, modeEveryMs).unref();
 }
 
