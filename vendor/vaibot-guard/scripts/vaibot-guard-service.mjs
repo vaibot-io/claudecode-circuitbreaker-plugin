@@ -386,7 +386,10 @@ async function refreshEffectiveMode() {
 // seconds when the server answers).
 if (CANONICAL_GOVERNANCE_BASE && VAIBOT_API_KEY) {
   refreshEffectiveMode().catch(() => {});
-  const modeEveryMs = Math.max(1000, Number(process.env.VAIBOT_MODE_REFRESH_MS || 300_000));
+  // 60s default (was 5min): a governance mode change should take effect within ~1min
+  // without a manual `vaibot mode show` refresh. The /me GET is small (~0.7s). Override
+  // with VAIBOT_MODE_REFRESH_MS.
+  const modeEveryMs = Math.max(1000, Number(process.env.VAIBOT_MODE_REFRESH_MS || 60_000));
   setInterval(() => { refreshEffectiveMode().catch(() => {}); }, modeEveryMs).unref();
 }
 
@@ -1509,6 +1512,17 @@ const server = http.createServer(async (req, res) => {
         denylist: SIGNED_DENYLIST,
         classifierTablesPresent: !!CLASSIFIER_TABLES,
       });
+    }
+
+    // On-demand mode re-poll: force an immediate control-plane fetch of the account
+    // mode so `vaibot mode show` (and what agents enforce) reflects a just-changed
+    // mode without waiting for the background timer. Authed — it triggers an outbound
+    // /me fetch and can flip what the guard enforces. Returns the (possibly updated)
+    // effective_mode the guard now enforces, so the CLI display stays honest.
+    if (req.method === "POST" && req.url === "/v1/mode/refresh") {
+      if (!requireAuth(req, res)) return;
+      await refreshEffectiveMode();
+      return json(res, 200, { ok: true, effective_mode: EFFECTIVE_MODE });
     }
 
     // policy hot-reload disabled (restart service to apply policy changes)
