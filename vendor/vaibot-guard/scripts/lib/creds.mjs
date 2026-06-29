@@ -324,9 +324,16 @@ export function resolveCredentials(opts = {}) {
   const envName = resolveEnv({ ...opts, env, store })
   // V2 governance: VAIBOT_GOVERNANCE_URL (new) → legacy VAIBOT_API_URL → stored slot
   // → canonical. V1 provenance: VAIBOT_PROVENANCE_URL → stored slot → canonical.
-  // Override gating (prod requires admin) is layered on by the guard/CLI callers.
-  const apiBaseUrl = governanceBaseForEnv(store, envName, env.VAIBOT_GOVERNANCE_URL ?? env.VAIBOT_API_URL)
-  const provenanceBaseUrl = provenanceBaseForEnv(store, envName, env.VAIBOT_PROVENANCE_URL)
+  // §5 flag-gate applied HERE (mirrors Rust resolve_credentials): a PRODUCTION
+  // override is suppressed unless VAIBOT_ALLOW_URL_OVERRIDE is set, so every consumer
+  // of resolveCredentials — including the plugin hooks, which have no preflight —
+  // gets the unbypassable safe default and can never send a prod bearer to an
+  // env-injected host. The admin half is layered by callers that can do a /me check.
+  const allow = urlOverrideAllowed(env)
+  const govOverride = gateUrlOverride(envName, env.VAIBOT_GOVERNANCE_URL ?? env.VAIBOT_API_URL, allow)
+  const provOverride = gateUrlOverride(envName, env.VAIBOT_PROVENANCE_URL, allow)
+  const apiBaseUrl = governanceBaseForEnv(store, envName, govOverride)
+  const provenanceBaseUrl = provenanceBaseForEnv(store, envName, provOverride)
 
   const record = store.environments?.[envName] ?? null
   const walletAddress = record?.wallet_address ?? null

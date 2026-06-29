@@ -43,8 +43,10 @@ const HOST = process.env.VAIBOT_GUARD_HOST || "127.0.0.1";
 // — there is no standalone VAIBOT_API_URL that could pair a staging key with a prod
 // endpoint (the bug this fixes). Explicit/legacy env overrides are still honored:
 //   VAIBOT_API_KEY        → bearer (else the env's stored key)
-//   VAIBOT_GOVERNANCE_URL → V2 base (policy / mode / decide / receipts)
-//   VAIBOT_PROVENANCE_URL → V1 base (/prove); deprecated VAIBOT_API_URL also maps here
+//   VAIBOT_GOVERNANCE_URL → V2 base (policy / mode / decide / receipts); deprecated
+//                           VAIBOT_API_URL aliases this (legacy V2 base — matches the
+//                           CLI + resolveCredentials, so /prove never mis-anchors to V2)
+//   VAIBOT_PROVENANCE_URL → V1 base (/prove)
 //   VAIBOT_POLICY_URL     → policy feed (else derived as {governance}/v2/policy)
 const CREDS_STORE = loadStore();
 const CREDS_ENV = resolveEnv({ store: CREDS_STORE });
@@ -57,8 +59,8 @@ const VAIBOT_API_KEY =
 // dropped unless VAIBOT_ALLOW_URL_OVERRIDE is set; a flag-enabled prod override is
 // "provisional" until the poll confirms admin, then a non-admin's override is revoked.
 const ALLOW_URL_OVERRIDE = urlOverrideAllowed(process.env);
-const GOV_OVERRIDE_REQ = process.env.VAIBOT_GOVERNANCE_URL || "";
-const PROV_OVERRIDE_REQ = process.env.VAIBOT_PROVENANCE_URL || process.env.VAIBOT_API_URL || "";
+const GOV_OVERRIDE_REQ = process.env.VAIBOT_GOVERNANCE_URL || process.env.VAIBOT_API_URL || "";
+const PROV_OVERRIDE_REQ = process.env.VAIBOT_PROVENANCE_URL || "";
 const CANONICAL_GOVERNANCE_BASE = governanceBaseForEnv(CREDS_STORE, CREDS_ENV, null);
 // Flag-gated overrides (null when a prod override lacks VAIBOT_ALLOW_URL_OVERRIDE).
 const GOV_OVERRIDE = gateUrlOverride(CREDS_ENV, GOV_OVERRIDE_REQ, ALLOW_URL_OVERRIDE);
@@ -2083,6 +2085,10 @@ server.listen(PORT, HOST, () => {
       instanceId: INSTANCE_ID,
       startedAt: Date.now(),
       effective_mode: EFFECTIVE_MODE,
+      // Publish the guard's resolved env so the CLI's production-coherence gate +
+      // `doctor` can read it from ONE place (the de-pinned env file no longer carries
+      // a VAIBOT_POLICY_URL to infer it from).
+      env: CREDS_ENV,
     });
   } catch (e) {
     // eslint-disable-next-line no-console
