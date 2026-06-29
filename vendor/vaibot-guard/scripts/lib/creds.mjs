@@ -90,6 +90,26 @@ export function provenanceBaseForEnv(store, envName, override) {
   return slotBase(override, store?.environments?.[envName]?.provenance?.url, canonical)
 }
 
+// Is the deliberate-act flag for a URL override set? (VAIBOT_ALLOW_URL_OVERRIDE
+// = 1/true/yes.) Required — together with an admin account — to redirect a
+// PRODUCTION base off its canonical host. Mirrors the CLI's url_override_allowed.
+export function urlOverrideAllowed(env = process.env) {
+  const v = String(env?.VAIBOT_ALLOW_URL_OVERRIDE ?? '').trim()
+  return v === '1' || v === 'true' || v === 'yes' || v === 'TRUE'
+}
+
+// §5 LOCAL gate on a requested URL override — the env-injectable half.
+// - non-production: honored. - production: honored ONLY when allowOverride is set,
+// else SUPPRESSED (→ stored slot / canonical) so a prod key is never diverted by an
+// env var alone. The ADMIN half (a prod override is admitted only for an admin
+// account) is enforced by the guard's /me poll, which revokes a non-admin's prod
+// override back to canonical. Falsy/empty in ⇒ null out.
+export function gateUrlOverride(envName, requested, allowOverride) {
+  if (!requested) return null
+  if (envName === 'production' && !allowOverride) return null
+  return requested
+}
+
 export function keyPrefixForEnv(envName) {
   return KEY_PREFIX[envName] ?? ''
 }

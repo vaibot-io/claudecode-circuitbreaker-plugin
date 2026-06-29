@@ -20,7 +20,7 @@ import { loadPolicyBundle, effectivePolicy, computeBundleHash, verifyBundle } fr
 import { pickPolicyPubkey } from "./pinned-keys.mjs";
 import { writeLock, readLock, LOCK_FILE } from "./lib/guard-bootstrap.mjs";
 import { loadGuardEnvFile } from "./lib/env-file.mjs";
-import { loadStore, resolveEnv, loadCredsForEnv, governanceBaseForEnv, provenanceBaseForEnv } from "./lib/creds.mjs";
+import { loadStore, resolveEnv, loadCredsForEnv, governanceBaseForEnv, provenanceBaseForEnv, urlOverrideAllowed, gateUrlOverride } from "./lib/creds.mjs";
 
 // One shared guard, one config — regardless of launcher. Under systemd the env is
 // already populated from EnvironmentFile=~/.config/vaibot-guard/vaibot-guard.env;
@@ -50,19 +50,47 @@ const CREDS_STORE = loadStore();
 const CREDS_ENV = resolveEnv({ store: CREDS_STORE });
 const VAIBOT_API_KEY =
   process.env.VAIBOT_API_KEY || loadCredsForEnv(CREDS_ENV, { store: CREDS_STORE })?.api_key || "";
-const GOVERNANCE_BASE = governanceBaseForEnv(CREDS_STORE, CREDS_ENV, process.env.VAIBOT_GOVERNANCE_URL);
-const PROVENANCE_BASE = provenanceBaseForEnv(
-  CREDS_STORE,
-  CREDS_ENV,
-  process.env.VAIBOT_PROVENANCE_URL || process.env.VAIBOT_API_URL,
-);
+
+// §5 url-override gate (mirrors the CLI). CANONICAL_GOVERNANCE_BASE is override-free
+// and is what the /me poll (mode + admin) talks to — so a URL override can never spoof
+// the admin verdict. The EFFECTIVE bases apply the flag-gate: a PRODUCTION override is
+// dropped unless VAIBOT_ALLOW_URL_OVERRIDE is set; a flag-enabled prod override is
+// "provisional" until the poll confirms admin, then a non-admin's override is revoked.
+const ALLOW_URL_OVERRIDE = urlOverrideAllowed(process.env);
+const GOV_OVERRIDE_REQ = process.env.VAIBOT_GOVERNANCE_URL || "";
+const PROV_OVERRIDE_REQ = process.env.VAIBOT_PROVENANCE_URL || process.env.VAIBOT_API_URL || "";
+const CANONICAL_GOVERNANCE_BASE = governanceBaseForEnv(CREDS_STORE, CREDS_ENV, null);
+// Flag-gated overrides (null when a prod override lacks VAIBOT_ALLOW_URL_OVERRIDE).
+const GOV_OVERRIDE = gateUrlOverride(CREDS_ENV, GOV_OVERRIDE_REQ, ALLOW_URL_OVERRIDE);
+const PROV_OVERRIDE = gateUrlOverride(CREDS_ENV, PROV_OVERRIDE_REQ, ALLOW_URL_OVERRIDE);
+const IS_PROD = CREDS_ENV === "production";
+// CONFIRM-THEN-APPLY: a flag-enabled PRODUCTION override is NOT used for key-sending
+// until the /me poll confirms admin (no key-leak window). Non-prod overrides apply at
+// once. So prod starts on canonical even when a flag-enabled override is present.
+let GOVERNANCE_BASE = governanceBaseForEnv(CREDS_STORE, CREDS_ENV, IS_PROD ? null : GOV_OVERRIDE);
+let PROVENANCE_BASE = provenanceBaseForEnv(CREDS_STORE, CREDS_ENV, IS_PROD ? null : PROV_OVERRIDE);
+let PROD_OVERRIDE_PENDING = IS_PROD && !!(GOV_OVERRIDE || PROV_OVERRIDE);
+if (IS_PROD) {
+  for (const [label, req] of [
+    ["VAIBOT_GOVERNANCE_URL", GOV_OVERRIDE_REQ],
+    ["VAIBOT_PROVENANCE_URL/VAIBOT_API_URL", PROV_OVERRIDE_REQ],
+  ]) {
+    if (!req) continue;
+    if (!ALLOW_URL_OVERRIDE)
+      console.error(`[vaibot-guard] ignoring production ${label} override (${req}); key stays on canonical host — set VAIBOT_ALLOW_URL_OVERRIDE=1 (admin only).`);
+    else
+      console.error(`[vaibot-guard] production ${label} override (${req}) deferred — applied only after /me confirms an admin account.`);
+  }
+}
+
 // Control-plane policy feed. Explicit VAIBOT_POLICY_URL wins; the sentinels
 // "off"/"none"/"disabled" turn fetching OFF (offline / air-gapped guard → only the
 // built-in defaults + any local VAIBOT_POLICY_BUNDLE_PATH apply); unset ⇒ derive
 // {governance}/v2/policy so a guard still tracks live policy even when the launcher
 // never pinned a URL (closes the "no pin ⇒ never fetch" gap).
 const _policyUrlEnv = (process.env.VAIBOT_POLICY_URL || "").trim();
-const POLICY_URL = /^(off|none|disabled)$/i.test(_policyUrlEnv)
+const POLICY_URL_PINNED = _policyUrlEnv.length > 0; // explicit (incl. off-sentinel) ⇒ don't re-derive on revoke
+let POLICY_URL = /^(off|none|disabled)$/i.test(_policyUrlEnv)
   ? ""
   : _policyUrlEnv || `${GOVERNANCE_BASE}/v2/policy`;
 
@@ -306,15 +334,38 @@ function republishMode() {
   }
 }
 
+// §5: apply a deferred production URL override once /me confirms an admin account.
+// Until then the guard runs on the canonical host, so a non-admin's prod key is never
+// diverted (and there's no startup key-leak window). Idempotent.
+function applyProdOverride() {
+  PROD_OVERRIDE_PENDING = false;
+  GOVERNANCE_BASE = governanceBaseForEnv(CREDS_STORE, CREDS_ENV, GOV_OVERRIDE);
+  PROVENANCE_BASE = provenanceBaseForEnv(CREDS_STORE, CREDS_ENV, PROV_OVERRIDE);
+  if (!POLICY_URL_PINNED) POLICY_URL = `${GOVERNANCE_BASE}/v2/policy`;
+  console.error("[vaibot-guard] production URL override applied (admin account confirmed).");
+}
+
 async function refreshEffectiveMode() {
-  if (!GOVERNANCE_BASE || !VAIBOT_API_KEY) return; // no control plane / no creds → keep current (fail-static)
+  // Always talk to the CANONICAL host (override-free) so a URL override can't spoof
+  // either the mode or the admin verdict.
+  if (!CANONICAL_GOVERNANCE_BASE || !VAIBOT_API_KEY) return; // no control plane / no creds → keep current (fail-static)
   try {
-    const res = await fetch(`${GOVERNANCE_BASE}/v2/accounts/me`, {
+    const res = await fetch(`${CANONICAL_GOVERNANCE_BASE}/v2/accounts/me`, {
       headers: { authorization: `Bearer ${VAIBOT_API_KEY}` },
       signal: AbortSignal.timeout(Number(process.env.VAIBOT_MODE_FETCH_TIMEOUT_MS || 3000)),
     });
     if (!res.ok) return; // transient/auth blip → fail-static
     const data = await res.json().catch(() => null);
+    if (!data) return;
+    // Apply a deferred prod override only for an admin; otherwise leave it on canonical.
+    if (PROD_OVERRIDE_PENDING) {
+      if (data.admin === true) {
+        applyProdOverride();
+      } else {
+        PROD_OVERRIDE_PENDING = false;
+        console.error("[vaibot-guard] production URL override refused (not an admin account) — staying on the canonical host.");
+      }
+    }
     const m = data?.enforcement?.effective_mode;
     if (m !== "observe" && m !== "enforce") return; // malformed/absent → fail-static
     if (m !== EFFECTIVE_MODE) {
@@ -330,7 +381,7 @@ async function refreshEffectiveMode() {
 // Poll the control plane for the account mode on its own timer (non-blocking at
 // boot — guard.json starts on the fail-safe default and is re-stamped within
 // seconds when the server answers).
-if (GOVERNANCE_BASE && VAIBOT_API_KEY) {
+if (CANONICAL_GOVERNANCE_BASE && VAIBOT_API_KEY) {
   refreshEffectiveMode().catch(() => {});
   const modeEveryMs = Math.max(1000, Number(process.env.VAIBOT_MODE_REFRESH_MS || 300_000));
   setInterval(() => { refreshEffectiveMode().catch(() => {}); }, modeEveryMs).unref();

@@ -64,6 +64,10 @@ export function apiBaseForEnv(env: VaibotEnv, override?: string): string
 export function governanceBaseForEnv(store: CredsStore | undefined, env: VaibotEnv, override?: string): string
 /** V1 provenance base: override → stored slot url → canonical default. */
 export function provenanceBaseForEnv(store: CredsStore | undefined, env: VaibotEnv, override?: string): string
+/** Is VAIBOT_ALLOW_URL_OVERRIDE set (1/true/yes)? Required — with admin — to redirect a prod base. */
+export function urlOverrideAllowed(env?: Record<string, string | undefined>): boolean
+/** §5 local gate: a production override is suppressed (→ null) unless `allowOverride`; non-prod honored. */
+export function gateUrlOverride(env: VaibotEnv, requested: string | null | undefined, allowOverride: boolean): string | null
 export function keyPrefixForEnv(env: VaibotEnv): string
 export function envForKey(apiKey: unknown): VaibotEnv | null
 export function keyPrefixMatchesEnv(apiKey: unknown, env: VaibotEnv): boolean
