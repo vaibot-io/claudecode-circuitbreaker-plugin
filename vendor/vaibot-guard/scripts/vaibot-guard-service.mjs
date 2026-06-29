@@ -20,6 +20,7 @@ import { loadPolicyBundle, effectivePolicy, computeBundleHash, verifyBundle } fr
 import { pickPolicyPubkey } from "./pinned-keys.mjs";
 import { writeLock, readLock, LOCK_FILE } from "./lib/guard-bootstrap.mjs";
 import { loadGuardEnvFile } from "./lib/env-file.mjs";
+import { loadStore, resolveEnv, loadCredsForEnv, governanceBaseForEnv, provenanceBaseForEnv } from "./lib/creds.mjs";
 
 // One shared guard, one config — regardless of launcher. Under systemd the env is
 // already populated from EnvironmentFile=~/.config/vaibot-guard/vaibot-guard.env;
@@ -35,6 +36,35 @@ if (_envFileKeys.length) {
 
 const PORT = Number(process.env.VAIBOT_GUARD_PORT || 39111);
 const HOST = process.env.VAIBOT_GUARD_HOST || "127.0.0.1";
+
+// ---- API config from the credentials file (v3 split: V2 governance / V1 provenance)
+// The guard derives its api key + governance/provenance bases from the resolved
+// env's slot in ~/.vaibot/credentials.json, so the V2 + V1 bases travel WITH the key
+// — there is no standalone VAIBOT_API_URL that could pair a staging key with a prod
+// endpoint (the bug this fixes). Explicit/legacy env overrides are still honored:
+//   VAIBOT_API_KEY        → bearer (else the env's stored key)
+//   VAIBOT_GOVERNANCE_URL → V2 base (policy / mode / decide / receipts)
+//   VAIBOT_PROVENANCE_URL → V1 base (/prove); deprecated VAIBOT_API_URL also maps here
+//   VAIBOT_POLICY_URL     → policy feed (else derived as {governance}/v2/policy)
+const CREDS_STORE = loadStore();
+const CREDS_ENV = resolveEnv({ store: CREDS_STORE });
+const VAIBOT_API_KEY =
+  process.env.VAIBOT_API_KEY || loadCredsForEnv(CREDS_ENV, { store: CREDS_STORE })?.api_key || "";
+const GOVERNANCE_BASE = governanceBaseForEnv(CREDS_STORE, CREDS_ENV, process.env.VAIBOT_GOVERNANCE_URL);
+const PROVENANCE_BASE = provenanceBaseForEnv(
+  CREDS_STORE,
+  CREDS_ENV,
+  process.env.VAIBOT_PROVENANCE_URL || process.env.VAIBOT_API_URL,
+);
+// Control-plane policy feed. Explicit VAIBOT_POLICY_URL wins; the sentinels
+// "off"/"none"/"disabled" turn fetching OFF (offline / air-gapped guard → only the
+// built-in defaults + any local VAIBOT_POLICY_BUNDLE_PATH apply); unset ⇒ derive
+// {governance}/v2/policy so a guard still tracks live policy even when the launcher
+// never pinned a URL (closes the "no pin ⇒ never fetch" gap).
+const _policyUrlEnv = (process.env.VAIBOT_POLICY_URL || "").trim();
+const POLICY_URL = /^(off|none|disabled)$/i.test(_policyUrlEnv)
+  ? ""
+  : _policyUrlEnv || `${GOVERNANCE_BASE}/v2/policy`;
 
 // Identity surfaced on /health so ensureGuard() (and any client) can confirm
 // the process on this port is really the VAIBot guard and is version-compatible
@@ -101,12 +131,14 @@ const FILE_MUTATION_DENIED_PATH_ACTION = POLICY.fileMutationDeniedPathAction || 
 // published package (a staging guard is picked up from VAIBOT_ENV or the pinned
 // VAIBOT_POLICY_URL). VAIBOT_POLICY_PUBKEY remains an explicit override for
 // local dev / CI / self-hosted setups.
-const POLICY_PUBKEY = pickPolicyPubkey();
+// Pin the pubkey for the env the creds file resolved to (so a staging guard gets
+// the staging key even when VAIBOT_ENV/VAIBOT_POLICY_URL aren't set in the env).
+const POLICY_PUBKEY = pickPolicyPubkey({ ...process.env, VAIBOT_ENV: CREDS_ENV });
 // When fetching from the control plane we cache to a WRITABLE path (LOG_DIR)
 // rather than the read-only skill references dir.
 const POLICY_BUNDLE_PATH =
   process.env.VAIBOT_POLICY_BUNDLE_PATH ||
-  (process.env.VAIBOT_POLICY_URL
+  (POLICY_URL
     ? path.join(LOG_DIR, "policy.bundle.json")
     : path.join(SKILL_DIR, "references", "policy.bundle.json"));
 
@@ -171,7 +203,7 @@ function applyLoadedBundle(loadResult) {
 // defaults — the hard-coded destructive floor still applies, so a revocation can
 // only drop user-added denials, never relax the safety net.
 async function refreshPolicy() {
-  const url = process.env.VAIBOT_POLICY_URL;
+  const url = POLICY_URL;
   if (!url || !POLICY_PUBKEY) return;
   let data;
   try {
@@ -226,12 +258,12 @@ applyLoadedBundle(loadPolicyBundle({ path: POLICY_BUNDLE_PATH, publicKeyPem: POL
 if (POLICY_BUNDLE.bundle && !POLICY_BUNDLE.ok) {
   console.error(`[vaibot-guard] signed policy bundle invalid (${POLICY_BUNDLE.reason}) — using built-in defaults (fail-closed).`);
 }
-if (process.env.VAIBOT_POLICY_URL && POLICY_PUBKEY) {
+if (POLICY_URL && POLICY_PUBKEY) {
   await refreshPolicy();
   const everyMs = Math.max(1000, Number(process.env.VAIBOT_POLICY_REFRESH_MS || 300_000));
   setInterval(() => { refreshPolicy().catch(() => {}); }, everyMs).unref();
-} else if (process.env.VAIBOT_POLICY_URL && !POLICY_PUBKEY) {
-  console.error("[vaibot-guard] VAIBOT_POLICY_URL set but VAIBOT_POLICY_PUBKEY missing — cannot verify a fetched bundle; skipping fetch (fail-closed).");
+} else if (POLICY_URL && !POLICY_PUBKEY) {
+  console.error("[vaibot-guard] policy feed configured but VAIBOT_POLICY_PUBKEY missing — cannot verify a fetched bundle; skipping fetch (fail-closed).");
 }
 
 // ---- Receipt tiering (M): the same classifier that drives decisions also
@@ -246,8 +278,6 @@ function receiptTierForExec(cmd, args) {
   return classify({ tool: "exec", input: { command } }, { tables: CLASSIFIER_TABLES }).receiptTier;
 }
 
-const VAIBOT_API_URL = process.env.VAIBOT_API_URL || ""; // e.g. https://provenance.vaibot.io/api
-const VAIBOT_API_KEY = process.env.VAIBOT_API_KEY || ""; // bearer token
 const VAIBOT_PROVE_MODEL = process.env.VAIBOT_PROVE_MODEL || "vaibot-guard"; // /api/prove requires model
 
 // ---- Effective enforce/observe mode (guard = single source of truth) ---------
@@ -265,14 +295,6 @@ function normalizeMode(m) {
 }
 let EFFECTIVE_MODE = normalizeMode(process.env.VAIBOT_MODE || "enforce");
 
-// Governance API base (where /v2/accounts/me lives), derived from the policy URL:
-// https://staging-api.vaibot.io/v2/policy → https://staging-api.vaibot.io
-function governanceBaseUrl() {
-  const u = (process.env.VAIBOT_POLICY_URL || "").trim();
-  if (!u) return "";
-  return u.replace(/\/v2\/policy\/?$/i, "").replace(/\/+$/, "");
-}
-
 // Re-stamp guard.json with the current mode (only if WE still own the lock) so
 // offline readers (CLI, gateway) see a live value without issuing a decide call.
 function republishMode() {
@@ -285,10 +307,9 @@ function republishMode() {
 }
 
 async function refreshEffectiveMode() {
-  const base = governanceBaseUrl();
-  if (!base || !VAIBOT_API_KEY) return; // no control plane / no creds → keep current (fail-static)
+  if (!GOVERNANCE_BASE || !VAIBOT_API_KEY) return; // no control plane / no creds → keep current (fail-static)
   try {
-    const res = await fetch(`${base}/v2/accounts/me`, {
+    const res = await fetch(`${GOVERNANCE_BASE}/v2/accounts/me`, {
       headers: { authorization: `Bearer ${VAIBOT_API_KEY}` },
       signal: AbortSignal.timeout(Number(process.env.VAIBOT_MODE_FETCH_TIMEOUT_MS || 3000)),
     });
@@ -309,7 +330,7 @@ async function refreshEffectiveMode() {
 // Poll the control plane for the account mode on its own timer (non-blocking at
 // boot — guard.json starts on the fail-safe default and is re-stamped within
 // seconds when the server answers).
-if (governanceBaseUrl() && VAIBOT_API_KEY) {
+if (GOVERNANCE_BASE && VAIBOT_API_KEY) {
   refreshEffectiveMode().catch(() => {});
   const modeEveryMs = Math.max(1000, Number(process.env.VAIBOT_MODE_REFRESH_MS || 300_000));
   setInterval(() => { refreshEffectiveMode().catch(() => {}); }, modeEveryMs).unref();
@@ -931,9 +952,9 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
 
 function postVaibotProve({ receipt, idempotencyKey }) {
   if (VAIBOT_PROVE_MODE === "off") return Promise.resolve(null);
-  if (!VAIBOT_API_URL || !VAIBOT_API_KEY) return Promise.resolve(null);
+  if (!PROVENANCE_BASE || !VAIBOT_API_KEY) return Promise.resolve(null);
 
-  const url = new URL(VAIBOT_API_URL.replace(/\/$/, "") + "/prove");
+  const url = new URL(PROVENANCE_BASE.replace(/\/$/, "") + "/prove");
   const body = JSON.stringify({
     content: JSON.stringify({ ...receipt, intent: redactIntent(receipt.intent) }),
     contentType: "application/json",
@@ -984,11 +1005,12 @@ function postVaibotProve({ receipt, idempotencyKey }) {
 
 /**
  * postGovernanceReceipt — Post a canonical governance receipt to VAIBot API v2.
- * Called best-effort on every finalize (tool or exec).
- * VAIBOT_API_URL format: https://provenance.vaibot.io/api  → appends /v2/receipts
+ * Called best-effort on every finalize (tool or exec). Targets the V2 governance
+ * base (e.g. https://api.vaibot.io) → POST {GOVERNANCE_BASE}/v2/receipts, the same
+ * host/routing the effective-mode poll uses — never the V1 provenance host.
  */
 function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, result, policyVersion }) {
-  if (!VAIBOT_API_URL || !VAIBOT_API_KEY) return Promise.resolve(null);
+  if (!GOVERNANCE_BASE || !VAIBOT_API_KEY) return Promise.resolve(null);
 
   const toolName = String(intent?.toolName || intent?.tool || intent?.cmd?.split(" ")[0] || "unknown");
   const command = String(intent?.cmd || intent?.command || toolName).slice(0, 500);
@@ -1047,9 +1069,8 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
     },
   };
 
-  // VAIBOT_API_URL is e.g. https://provenance.vaibot.io/api — strip trailing /api and append /api/v2/receipts
-  const baseUrl = VAIBOT_API_URL.replace(/\/api\/?$/, "");
-  const targetUrl = new URL(baseUrl + "/api/v2/receipts");
+  // GOVERNANCE_BASE is e.g. https://api.vaibot.io — v2 routes hang directly off it.
+  const targetUrl = new URL(GOVERNANCE_BASE.replace(/\/$/, "") + "/v2/receipts");
   const body = JSON.stringify(receiptPayload);
 
   const options = {
@@ -1224,10 +1245,10 @@ function buildInclusionProof(leaves, index) {
 
 async function tryFlushCheckpoints(sessionId) {
   if (VAIBOT_PROVE_MODE === "off") return;
-  const proveConfigured = !!(VAIBOT_API_URL && VAIBOT_API_KEY);
+  const proveConfigured = !!(PROVENANCE_BASE && VAIBOT_API_KEY);
   if (!proveConfigured) {
     if (VAIBOT_PROVE_MODE === "required") {
-      throw new Error("VAIBOT_PROVE_MODE=required but VAIBOT_API_URL/VAIBOT_API_KEY not configured");
+      throw new Error("VAIBOT_PROVE_MODE=required but no provenance API key configured");
     }
     return;
   }
@@ -1606,12 +1627,12 @@ const server = http.createServer(async (req, res) => {
 
       // Fail-closed: if required mode is enabled, deny execution if we cannot prove the precheck receipt.
       if (VAIBOT_PROVE_MODE === "required") {
-        if (!VAIBOT_API_URL || !VAIBOT_API_KEY) {
+        if (!PROVENANCE_BASE || !VAIBOT_API_KEY) {
           return json(res, 200, {
             ok: true,
             runId,
             risk,
-            decision: { decision: "deny", reason: "VAIBOT_PROVE_MODE=required but VAIBOT_API_URL/VAIBOT_API_KEY not configured" },
+            decision: { decision: "deny", reason: "VAIBOT_PROVE_MODE=required but no provenance API key configured" },
             audit,
             prove,
           });
@@ -1755,12 +1776,12 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (VAIBOT_PROVE_MODE === "required") {
-        if (!VAIBOT_API_URL || !VAIBOT_API_KEY) {
+        if (!PROVENANCE_BASE || !VAIBOT_API_KEY) {
           return json(res, 200, {
             ok: true,
             runId,
             risk,
-            decision: { decision: "deny", reason: "VAIBOT_PROVE_MODE=required but VAIBOT_API_URL/VAIBOT_API_KEY not configured" },
+            decision: { decision: "deny", reason: "VAIBOT_PROVE_MODE=required but no provenance API key configured" },
             audit,
             prove,
           });
@@ -1845,8 +1866,8 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (VAIBOT_PROVE_MODE === "required") {
-        if (!VAIBOT_API_URL || !VAIBOT_API_KEY) {
-          return json(res, 500, { ok: false, error: "VAIBOT_PROVE_MODE=required but VAIBOT_API_URL/VAIBOT_API_KEY not configured", audit, prove });
+        if (!PROVENANCE_BASE || !VAIBOT_API_KEY) {
+          return json(res, 500, { ok: false, error: "VAIBOT_PROVE_MODE=required but no provenance API key configured", audit, prove });
         }
         if (proveError || (prove && prove.ok === false)) {
           return json(res, 500, { ok: false, error: `VAIBOT_PROVE_MODE=required but /api/prove finalize failed: ${proveError || prove?.error || "unknown"}`, audit, prove });
@@ -1939,8 +1960,8 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (VAIBOT_PROVE_MODE === "required") {
-        if (!VAIBOT_API_URL || !VAIBOT_API_KEY) {
-          return json(res, 500, { ok: false, error: "VAIBOT_PROVE_MODE=required but VAIBOT_API_URL/VAIBOT_API_KEY not configured", audit, prove });
+        if (!PROVENANCE_BASE || !VAIBOT_API_KEY) {
+          return json(res, 500, { ok: false, error: "VAIBOT_PROVE_MODE=required but no provenance API key configured", audit, prove });
         }
         if (proveError || (prove && prove.ok === false)) {
           return json(res, 500, { ok: false, error: `VAIBOT_PROVE_MODE=required but /api/prove finalize failed: ${proveError || prove?.error || "unknown"}`, audit, prove });
@@ -1975,9 +1996,9 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-if (VAIBOT_PROVE_MODE === "required" && (!VAIBOT_API_URL || !VAIBOT_API_KEY)) {
+if (VAIBOT_PROVE_MODE === "required" && (!PROVENANCE_BASE || !VAIBOT_API_KEY)) {
   // eslint-disable-next-line no-console
-  console.error("[vaibot-guard] refusing to start: VAIBOT_PROVE_MODE=required but VAIBOT_API_URL/VAIBOT_API_KEY not configured");
+  console.error("[vaibot-guard] refusing to start: VAIBOT_PROVE_MODE=required but no provenance API key configured");
   process.exit(2);
 }
 

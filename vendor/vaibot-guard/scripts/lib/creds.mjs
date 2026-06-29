@@ -11,29 +11,44 @@
 // scripts/lib/creds.mjs, guarded by a parity test. TypeScript consumers
 // (@vaibot/cli, the OpenClaw plugin) import it via the bundled creds.d.mts.
 //
-// Store schema (v2), ~/.vaibot/credentials.json:
+// Store schema (v3), ~/.vaibot/credentials.json:
 //   {
-//     "version": 2,
+//     "version": 3,
 //     "active_env": "production",
 //     "environments": {
-//       "production": { "api_key": "vb_live_…", "wallet_address": "0x…" },
-//       "staging":    { "api_key": "vb_stg_…", "wallet_address": "0x…" }
+//       "production": {
+//         "api_key": "vb_live_…", "wallet_address": "0x…",
+//         "governance": { "url": null },   // V2; null ⇒ canonical default
+//         "provenance": { "url": null }    // V1; null ⇒ canonical default
+//       },
+//       "staging": { "api_key": "vb_stg_…", "wallet_address": "0x…" }
 //     }
 //   }
-// Only api_key + wallet_address are persisted — everything else is derivable
-// (api_url from env) or fetchable (/v2/accounts/me).
+// api_key + wallet_address persist; governance/provenance URLs persist only when an
+// explicit override is stored — otherwise each resolves to its canonical per-env
+// default. V1 provenance and V2 governance bases are tracked SEPARATELY so a staging
+// key can never anchor to a prod provenance endpoint. A v2 file (no slots) reads
+// transparently and upgrades on next write. See docs/credentials-v2-split.md.
 
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-export const STORE_VERSION = 2
+export const STORE_VERSION = 3
 export const ENVS = /** @type {const} */ (['production', 'staging'])
 export const DEFAULT_ENV = 'production'
 
+// V2 governance bases per env.
 const API_BASE = {
   production: 'https://api.vaibot.io',
   staging: 'https://staging-api.vaibot.io',
+}
+
+// V1 provenance bases per env. The V1 proxy routes under /api, so the base
+// INCLUDES /api; callers append /prove.
+const PROVENANCE_BASE = {
+  production: 'https://provenance.vaibot.io/api',
+  staging: 'https://vaibot-api-v1.fly.dev/api',
 }
 
 // Server-enforced key prefixes (apps/api): vb_live_* on prod, vb_stg_* on staging.
@@ -51,6 +66,28 @@ export function isEnv(value) {
 export function apiBaseForEnv(envName, override) {
   if (override) return String(override).replace(/\/+$/, '')
   return API_BASE[envName] ?? API_BASE[DEFAULT_ENV]
+}
+
+// Shared precedence: non-empty override → non-empty stored slot url → canonical.
+function slotBase(override, stored, canonical) {
+  if (override) return String(override).replace(/\/+$/, '')
+  if (typeof stored === 'string' && stored) return stored.replace(/\/+$/, '')
+  return canonical
+}
+
+// V2 GOVERNANCE base for an env: override → stored slot url → canonical.
+// Policy, mode-poll, decide, and governance receipts hang off this.
+export function governanceBaseForEnv(store, envName, override) {
+  const canonical = API_BASE[envName] ?? API_BASE[DEFAULT_ENV]
+  return slotBase(override, store?.environments?.[envName]?.governance?.url, canonical)
+}
+
+// V1 PROVENANCE base for an env: override → stored slot url → canonical.
+// `/prove` anchoring hangs off this. Tracked separately from governance so a
+// staging key can never anchor to the prod provenance endpoint.
+export function provenanceBaseForEnv(store, envName, override) {
+  const canonical = PROVENANCE_BASE[envName] ?? PROVENANCE_BASE[DEFAULT_ENV]
+  return slotBase(override, store?.environments?.[envName]?.provenance?.url, canonical)
 }
 
 export function keyPrefixForEnv(envName) {
@@ -130,6 +167,12 @@ function slimRecord(rec) {
   if (typeof rec.wallet_address === 'string' && rec.wallet_address) {
     out.wallet_address = rec.wallet_address
   }
+  // Persist a slot only when it carries an explicit override — a stock record
+  // (URLs derived from canonical defaults) stays as { api_key, wallet_address }.
+  for (const slot of ['governance', 'provenance']) {
+    const url = rec?.[slot]?.url
+    if (typeof url === 'string' && url) out[slot] = { url }
+  }
   return out
 }
 
@@ -137,8 +180,11 @@ function slimRecord(rec) {
 export function migrateStore(raw) {
   if (!raw || typeof raw !== 'object') return emptyStore()
 
-  // Already v2 (or newer with environments) — normalize defensively.
-  if (raw.version >= STORE_VERSION && raw.environments && typeof raw.environments === 'object') {
+  // v2 AND v3 both nest under `environments` — gate on its presence, NOT the version
+  // number (gating on version>=3 would drop a v2 file to an empty store). slimRecord
+  // carries the optional governance/provenance slots; absent in v2 ⇒ canonical
+  // defaults on read, so a v2 file upgrades to v3 transparently on the next write.
+  if (raw.environments && typeof raw.environments === 'object') {
     const out = emptyStore()
     out.active_env = isEnv(raw.active_env) ? raw.active_env : DEFAULT_ENV
     for (const e of ENVS) {
@@ -228,7 +274,7 @@ export function migrateFileIfNeeded(opts = {}) {
   }
 
   if (parsed && parsed.version >= STORE_VERSION) {
-    return { migrated: false, reason: 'already-v2' }
+    return { migrated: false, reason: 'already-current' }
   }
 
   const store = migrateStore(parsed)
@@ -256,7 +302,11 @@ export function resolveCredentials(opts = {}) {
   const env = opts.env ?? process.env
   const store = opts.store ?? loadStore(opts)
   const envName = resolveEnv({ ...opts, env, store })
-  const apiBaseUrl = apiBaseForEnv(envName, env.VAIBOT_API_URL)
+  // V2 governance: VAIBOT_GOVERNANCE_URL (new) → legacy VAIBOT_API_URL → stored slot
+  // → canonical. V1 provenance: VAIBOT_PROVENANCE_URL → stored slot → canonical.
+  // Override gating (prod requires admin) is layered on by the guard/CLI callers.
+  const apiBaseUrl = governanceBaseForEnv(store, envName, env.VAIBOT_GOVERNANCE_URL ?? env.VAIBOT_API_URL)
+  const provenanceBaseUrl = provenanceBaseForEnv(store, envName, env.VAIBOT_PROVENANCE_URL)
 
   const record = store.environments?.[envName] ?? null
   const walletAddress = record?.wallet_address ?? null
@@ -269,5 +319,5 @@ export function resolveCredentials(opts = {}) {
     keyMismatch = true
   }
 
-  return { env: envName, apiBaseUrl, apiKey, walletAddress, keyMismatch }
+  return { env: envName, apiBaseUrl, provenanceBaseUrl, apiKey, walletAddress, keyMismatch }
 }

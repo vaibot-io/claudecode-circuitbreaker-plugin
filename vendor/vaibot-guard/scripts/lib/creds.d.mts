@@ -4,10 +4,20 @@
 
 export type VaibotEnv = 'production' | 'staging'
 
+/** Per-API endpoint slot. `url` absent/null ⇒ the env's canonical default. Nested
+ *  so a per-slot api_key (approach B) can be added later without reshaping. */
+export interface ApiSlot {
+  url?: string | null
+}
+
 export interface CredsRecord {
   api_key: string
   /** Public on-chain identity — display only, never trusted for authz. */
   wallet_address?: string
+  /** V2 governance endpoint override (absent ⇒ canonical default). */
+  governance?: ApiSlot
+  /** V1 provenance endpoint override (absent ⇒ canonical default). */
+  provenance?: ApiSlot
 }
 
 export interface CredsStore {
@@ -29,7 +39,10 @@ export interface CredsOpts {
 
 export interface ResolvedCredentials {
   env: VaibotEnv
+  /** V2 governance base (policy / mode / decide / receipts). */
   apiBaseUrl: string
+  /** V1 provenance base (`/prove` anchoring) — resolved separately from governance. */
+  provenanceBaseUrl: string
   apiKey: string | null
   walletAddress: string | null
   keyMismatch: boolean
@@ -37,7 +50,7 @@ export interface ResolvedCredentials {
 
 export interface MigrateFileResult {
   migrated: boolean
-  reason?: 'no-file' | 'unparseable' | 'already-v2'
+  reason?: 'no-file' | 'unparseable' | 'already-current'
   store?: CredsStore
 }
 
@@ -47,6 +60,10 @@ export const DEFAULT_ENV: VaibotEnv
 
 export function isEnv(value: unknown): value is VaibotEnv
 export function apiBaseForEnv(env: VaibotEnv, override?: string): string
+/** V2 governance base: override → stored slot url → canonical default. */
+export function governanceBaseForEnv(store: CredsStore | undefined, env: VaibotEnv, override?: string): string
+/** V1 provenance base: override → stored slot url → canonical default. */
+export function provenanceBaseForEnv(store: CredsStore | undefined, env: VaibotEnv, override?: string): string
 export function keyPrefixForEnv(env: VaibotEnv): string
 export function envForKey(apiKey: unknown): VaibotEnv | null
 export function keyPrefixMatchesEnv(apiKey: unknown, env: VaibotEnv): boolean
