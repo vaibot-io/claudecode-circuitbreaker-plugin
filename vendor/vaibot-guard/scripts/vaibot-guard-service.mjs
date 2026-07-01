@@ -203,6 +203,7 @@ let SIGNED_POLICY;     // effectivePolicy(POLICY_BUNDLE)
 let SIGNED_DENYLIST;   // SIGNED_POLICY.denylist
 let SIGNED_DENYTOKENS; // SIGNED_POLICY.denyTokens — word-boundary command-family denials
 let SIGNED_APPROVETOKENS; // SIGNED_POLICY.approveTokens — word-boundary ask escalations
+let SIGNED_ESCALATE_AT;   // SIGNED_POLICY.escalateAt — per-preset ask threshold (undefined ⇒ default MEDIUM)
 let SIGNED_DENYPATHS;     // SIGNED_POLICY.denyPaths — unioned onto local DENY_PATHS
 let EFFECTIVE_FILEMUT_ACTION = FILE_MUTATION_OUTSIDE_WORKSPACE_ACTION; // local ∪ signed (deny wins)
 let CLASSIFIER_TABLES; // SIGNED_POLICY.classifierTables, after the G-163 safety gate
@@ -213,6 +214,7 @@ function applyLoadedBundle(loadResult) {
   SIGNED_DENYLIST = SIGNED_POLICY.denylist;
   SIGNED_DENYTOKENS = Array.isArray(SIGNED_POLICY.denyTokens) ? SIGNED_POLICY.denyTokens : [];
   SIGNED_APPROVETOKENS = Array.isArray(SIGNED_POLICY.approveTokens) ? SIGNED_POLICY.approveTokens : [];
+  SIGNED_ESCALATE_AT = typeof SIGNED_POLICY.escalateAt === "string" ? SIGNED_POLICY.escalateAt : undefined;
   SIGNED_DENYPATHS = Array.isArray(SIGNED_POLICY.denyPaths) ? SIGNED_POLICY.denyPaths : [];
   // Tighten-only: a signed bundle can escalate outside-workspace writes to deny, never relax to approve.
   EFFECTIVE_FILEMUT_ACTION =
@@ -775,7 +777,7 @@ function decideExec({ sessionId, cmd, args, intent }) {
 
   // D: signed-policy denylist + classifier dangerous-deny (safety floor).
   if (SIGNED_DENYLIST.includes(String(cmd))) return { decision: "deny", reason: "Denied by signed policy denylist" };
-  const clsExec = classify({ tool: "exec", input: { command: joined } }, { tables: CLASSIFIER_TABLES });
+  const clsExec = classify({ tool: "exec", input: { command: joined } }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT });
   // floor:true marks the un-overridable catastrophic floor (Tier-0) so clients
   // can enforce it even in observe mode.
   if (clsExec.verdictHint === "deny") return { decision: "deny", reason: `Classifier: ${clsExec.reasons[0] || "dangerous"}`, floor: true };
@@ -818,13 +820,21 @@ function decideExec({ sessionId, cmd, args, intent }) {
     }
   }
 
-  const approve = matchToken([...APPROVE_TOKENS, ...(SIGNED_APPROVETOKENS || [])], joined);
-  if (approve) {
-    return {
-      decision: "approve",
-      reason: `Approval required for token: ${approve}`,
-      approvalId: `appr_${randomUUID()}`,
-    };
+  // Approve/ask token lane — two sources, two policies:
+  //  - SIGNED_APPROVETOKENS = the user's EXPLICIT "ask on this" policy → honored unconditionally.
+  //  - APPROVE_TOKENS = the built-in heuristic net → AND-conditioned on classifier concurrence:
+  //    a substring match only pauses a command the classifier ALSO rates non-safe. A match on a
+  //    classifier-safe command (".env" in a config grep, "curl" in a localhost health check,
+  //    "ncat" in a "\ncat" heredoc) must NOT pause — the classifier's "safe" verdict wins. Real
+  //    egress still pauses because the classifier itself rates it HIGH. (See the egress /
+  //    exfiltration threat-model note: secret reads are benign; exfil is the risk.)
+  const signedApprove = matchToken(SIGNED_APPROVETOKENS || [], joined);
+  if (signedApprove) {
+    return { decision: "approve", reason: `Approval required for token: ${signedApprove}`, approvalId: `appr_${randomUUID()}` };
+  }
+  const builtinApprove = matchToken(APPROVE_TOKENS, joined);
+  if (builtinApprove && clsExec.verdictHint !== "allow") {
+    return { decision: "approve", reason: `Approval required for token: ${builtinApprove}`, approvalId: `appr_${randomUUID()}` };
   }
 
   // Fail-closed baseline: ONLY a classifier-safe action falls through to allow.
@@ -938,7 +948,7 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
   // D: signed-policy denylist (safety floor) + classifier dangerous-deny —
   // checked before the guard's own token/rule posture so they can only ADD denies.
   if (SIGNED_DENYLIST.includes(tn)) return { decision: "deny", reason: "Denied by signed policy denylist" };
-  const cls = classify({ tool: toolName, input: params }, { tables: CLASSIFIER_TABLES });
+  const cls = classify({ tool: toolName, input: params }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT });
   // floor:true marks the un-overridable catastrophic floor (Tier-0).
   if (cls.verdictHint === "deny") return { decision: "deny", reason: `Classifier: ${cls.reasons[0] || "dangerous"}`, floor: true };
 
@@ -946,8 +956,12 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
   const deny = matchToken([...DENY_TOKENS, ...(SIGNED_DENYTOKENS || [])], joined);
   if (deny) return { decision: "deny", reason: `Denied token: ${deny}` };
 
-  const approve = matchToken([...APPROVE_TOKENS, ...(SIGNED_APPROVETOKENS || [])], joined);
-  if (approve) return { decision: "approve", reason: `Approval required for token: ${approve}`, approvalId: `appr_${randomUUID()}` };
+  // Approve/ask token lane — signed tokens honored unconditionally; the built-in heuristic net is
+  // AND-conditioned on classifier concurrence (see decideExec + the egress threat-model note).
+  const signedApprove = matchToken(SIGNED_APPROVETOKENS || [], joined);
+  if (signedApprove) return { decision: "approve", reason: `Approval required for token: ${signedApprove}`, approvalId: `appr_${randomUUID()}` };
+  const builtinApprove = matchToken(APPROVE_TOKENS, joined);
+  if (builtinApprove && cls.verdictHint !== "allow") return { decision: "approve", reason: `Approval required for token: ${builtinApprove}`, approvalId: `appr_${randomUUID()}` };
 
   // Tool-specific posture
   const lower = tn.toLowerCase();

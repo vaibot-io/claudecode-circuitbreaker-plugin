@@ -124,8 +124,10 @@ const GUARD_PROTECT_PATTERNS = [
 // Elevated-risk patterns → HIGH (ask). Recoverable-but-consequential.
 const HIGH_PATTERNS = [
   /\bsudo\b/i,
-  /\bgit\s+push\b[^|&;]*(--force|\s-f\b)/i,
-  /\bnpm\s+publish\b/i,
+  /(^|[\n|&;]\s*)su\b/i, // bare `su` — privilege escalation, same class as sudo
+  /\bgit\s+push\b/i,
+  /\b(npm|pnpm|yarn)\s+publish\b/i,
+  /\b(flyctl?|fly|vercel|netlify)\s+deploy\b/i,
   /\bgit\s+reset\s+--hard\b/i,
   /\bgit\s+clean\s+-[a-z]*f/i,
   /(^|[\s>])>\s*\/etc\//i,
@@ -230,7 +232,7 @@ export function classifyBash(command, tables = defaultTables()) {
     if (net.has(cmd)) {
       category = CATEGORY.NETWORK
       boundary = unionBoundary(boundary, BOUNDARY.BOTH)
-      risk = maxRisk(risk, RISK.MEDIUM)
+      risk = maxRisk(risk, RISK.HIGH) // egress stays on the ask lane even at balanced's HIGH threshold
       reversible = false
       reasons.push(`network command: ${cmd}`)
     } else if (cmd === 'git') {
@@ -267,11 +269,17 @@ export function classifyBash(command, tables = defaultTables()) {
   return { category, risk, boundary, reversible, reasons }
 }
 
-/** Map a risk level to a verdict hint. */
-export function verdictForRisk(risk) {
+/**
+ * Map a risk level to a verdict hint, given the (per-preset) escalation
+ * threshold. DANGEROUS always denies (Tier-0 floor). Otherwise, risk that
+ * meets/exceeds `escalateAt` asks; below it allows. Default MEDIUM preserves
+ * the prior behavior; the balanced preset raises it to HIGH ("medium = safe").
+ */
+export function verdictForRisk(risk, escalateAt = RISK.MEDIUM) {
   if (risk === RISK.DANGEROUS) return VERDICT.DENY
-  if (risk === RISK.HIGH || risk === RISK.MEDIUM) return VERDICT.ASK
-  return VERDICT.ALLOW // safe / low
+  const threshold = RISK_RANK[escalateAt] ?? RISK_RANK[RISK.MEDIUM]
+  if (RISK_RANK[risk] >= threshold) return VERDICT.ASK
+  return VERDICT.ALLOW
 }
 
 /** Map risk + boundary to a receipt tier. */
@@ -310,6 +318,7 @@ function inputPath(input) {
  */
 export function classify(call, cfg = {}) {
   const tables = cfg.tables ?? defaultTables()
+  const escalateAt = cfg.escalateAt // per-preset ask threshold (undefined ⇒ default MEDIUM)
   const rawTool = String(call?.tool ?? '')
   const tool = norm(rawTool)
   const input = call?.input
@@ -334,7 +343,7 @@ export function classify(call, cfg = {}) {
   if (execTools.has(tool)) {
     const command = typeof input === 'string' ? input : input?.command ?? input?.cmd ?? ''
     const b = classifyBash(command, tables)
-    return finalize(rawTool, b.category, b.risk, b.boundary, b.reversible, b.reasons)
+    return finalize(rawTool, b.category, b.risk, b.boundary, b.reversible, b.reasons, escalateAt)
   }
 
   if (readTools.has(tool)) {
@@ -359,7 +368,7 @@ export function classify(call, cfg = {}) {
     category = CATEGORY.NETWORK
     boundary = BOUNDARY.BOTH
     reversible = false
-    risk = RISK.MEDIUM
+    risk = RISK.HIGH // egress stays on the ask lane even at balanced's HIGH threshold
     reasons.push(`network tool: ${tool}`)
   } else if (rawTool.startsWith('mcp__')) {
     // Third-party MCP tool — its result is untrusted ingress; could egress too.
@@ -380,17 +389,17 @@ export function classify(call, cfg = {}) {
     reasons.push('touches a sensitive path/secret')
   }
 
-  return finalize(rawTool, category, risk, boundary, reversible, reasons)
+  return finalize(rawTool, category, risk, boundary, reversible, reasons, escalateAt)
 }
 
-function finalize(tool, category, risk, boundary, reversible, reasons) {
+function finalize(tool, category, risk, boundary, reversible, reasons, escalateAt) {
   return {
     tool,
     category,
     risk,
     boundary,
     reversible,
-    verdictHint: verdictForRisk(risk),
+    verdictHint: verdictForRisk(risk, escalateAt),
     receiptTier: receiptTierFor(risk, boundary),
     reasons,
   }

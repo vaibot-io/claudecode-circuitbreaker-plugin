@@ -151,6 +151,7 @@ export function effectivePolicy(loadResult) {
           ? p.fileMutationOutsideWorkspaceAction
           : undefined,
       classifierTables: p.classifierTables ?? undefined,
+      escalateAt: typeof p.escalateAt === 'string' ? p.escalateAt : undefined,
     }
   }
   return {
