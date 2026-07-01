@@ -30,13 +30,13 @@ MCowBQYDK2VwAyEAJR303uV+dldFIk9AbAoK4Qpy4MP2opdQEho2k7px0hs=
 `
 
 // ── Production ──────────────────────────────────────────────────────────────
-// Not provisioned yet. When prod is set up, generate a fresh Ed25519 keypair
-// (NEVER reuse staging) and replace the empty string below in a new client
-// release. Empty string means "no pinned key" — the guard's existing
-// fail-closed code path will refuse to verify a bundle and fall back to the
-// safe built-in classifier defaults, so an unprovisioned production pubkey
-// degrades gracefully instead of trusting a stale staging key.
-export const PINNED_PROD_PUBKEY = ''
+// Provisioned 2026-07-01 on Fly app `vaibot-api-v2`. Fresh Ed25519 keypair
+// (NOT the staging key). Private key lives in the `VAIBOT_POLICY_SIGNING_KEY`
+// Fly secret + operator backup at ~/.vaibot/keys/prod-policy-private.pem.
+export const PINNED_PROD_PUBKEY = `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA9+/s5497t4v6KilCl6TfP80qf4KmMNwzswMzi4KUKuc=
+-----END PUBLIC KEY-----
+`
 
 /**
  * Resolve the policy-bundle public key for the current process.
