@@ -45,6 +45,27 @@ function startMockServer(handler) {
   })
 }
 
+// v3 creds resolve the account base (/me nudge, /v2/bootstrap) from the SINGLE
+// credentials.json — its per-env governance slot — not an env var. Seed that file
+// so the hook reads the mock URL the way a real install reads its stored slot
+// (no VAIBOT_GOVERNANCE_URL override, no §5 flag). Merge-writes so a prior
+// bootstrap's saved key survives a re-seed.
+function seedCredsUrl(homeDir, { env = 'staging', url, apiKey } = {}) {
+  const dir = join(homeDir, '.vaibot')
+  const file = join(dir, 'credentials.json')
+  let store
+  try { store = JSON.parse(readFileSync(file, 'utf-8')) } catch { store = { version: 3, active_env: env, environments: {} } }
+  store.version = 3
+  store.active_env = store.active_env ?? env
+  store.environments = store.environments ?? {}
+  store.environments[env] = store.environments[env] ?? {}
+  store.environments[env].governance = { url }
+  store.environments[env].provenance = { url }
+  if (apiKey) store.environments[env].api_key = apiKey
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(file, JSON.stringify(store))
+}
+
 function runHook({ apiUrl, mode = 'enforce', input }) {
   // Per-call fake HOME isolates the new breaker-state file at
   // ~/.vaibot/breaker-state/claudecode.json from the user's real home and
@@ -52,6 +73,7 @@ function runHook({ apiUrl, mode = 'enforce', input }) {
   // NOT sandboxed here — existing tests reach into it via path helpers; the
   // new breaker.test.mjs sandboxes it via TMPDIR for its own scenarios.
   const fakeHome = mkdtempSync(join(tmpdir(), 'vaibot-claudecode-test-home-'))
+  seedCredsUrl(fakeHome, { url: apiUrl, apiKey: 'test-key' }) // account base + key from the file (single store), no env override
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [SCRIPT], {
       env: {
@@ -598,6 +620,11 @@ test('bootstrap fingerprint is identical across different cwds (no cwd in formul
           ...process.env,
           HOME: fakeHome,
           VAIBOT_API_URL: server.url,
+          // Bootstrap (no key yet) can't read a URL from the slim store — a keyless
+          // env record is dropped by migrateStore — so the account base comes from the
+          // env override. staging ⇒ honored without the §5 prod flag; mock issues vb_stg_.
+          VAIBOT_GOVERNANCE_URL: server.url,
+          VAIBOT_ENV: 'staging',
           VAIBOT_GUARD_BASE_URL: server.url,
           VAIBOT_GUARD_TOKEN: 'test-guard-token',
           VAIBOT_API_KEY: '',
