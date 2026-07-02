@@ -145,6 +145,14 @@ const SENSITIVE_PATTERNS = [
   /\.kube\/config\b/i, /\bprintenv\b/i,
 ]
 
+// System-config command HEADS → HIGH (ask). Managing host schedulers / process
+// supervisors is consequential-but-reversible, so it takes human approval rather
+// than a hard deny — this lets operators manage them under approval AND lets a
+// fresh install bootstrap the guard's own unit under approval instead of being
+// hard-blocked. Matched on the command HEAD (leadingWord) only, so the same word
+// appearing as an argument ("restart the foo service") is NOT escalated.
+const SYSTEM_CONFIG_CMDS = new Set(['systemctl', 'service', 'launchctl', 'crontab', 'cron'])
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 function norm(s) {
@@ -248,6 +256,14 @@ export function classifyBash(command, tables = defaultTables()) {
         reversible = false
         reasons.push(`git mutating: ${sub || '(none)'}`)
       }
+    } else if (SYSTEM_CONFIG_CMDS.has(cmd)) {
+      // Host scheduler / process-supervisor management → HIGH ⇒ ask (approval),
+      // never a hard deny. Command-head only (see SYSTEM_CONFIG_CMDS note).
+      category = CATEGORY.EXEC
+      boundary = unionBoundary(boundary, BOUNDARY.EGRESS)
+      risk = maxRisk(risk, RISK.HIGH)
+      reversible = false
+      reasons.push(`system-config command (approval): ${cmd}`)
     } else if (write.has(cmd)) {
       category = CATEGORY.WRITE
       boundary = unionBoundary(boundary, BOUNDARY.EGRESS)

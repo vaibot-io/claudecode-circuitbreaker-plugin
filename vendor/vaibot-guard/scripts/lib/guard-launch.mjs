@@ -10,7 +10,23 @@
 
 import { spawn } from 'node:child_process'
 import net from 'node:net'
+import { openSync, mkdirSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { ensureGuard, httpHealth } from './guard-bootstrap.mjs'
+
+// Where the daemon's own boot stdout/stderr is tee'd, so a spawn that never turns
+// healthy leaves a diagnosable trail instead of failing silently.
+export const LAUNCH_LOG = join(homedir(), '.vaibot', 'guard', 'launch.log')
+
+function openLaunchLog() {
+  try {
+    mkdirSync(join(homedir(), '.vaibot', 'guard'), { recursive: true, mode: 0o700 })
+    return openSync(LAUNCH_LOG, 'a', 0o600)
+  } catch {
+    return null // best-effort — never block a spawn on logging
+  }
+}
 
 /** Resolve true if something is already listening on host:port. */
 export function tcpProbe(host, port, opts = {}) {
@@ -43,9 +59,17 @@ export function tcpProbe(host, port, opts = {}) {
  *   - never healthy / error  → { outcome: 'failed', error }
  */
 export function makeLauncher(cfg = {}) {
-  const { guardScript, baseEnv = {}, healthTimeoutMs = 4000, pollMs = 150 } = cfg
+  // 10s default cold-start budget (was 4s): a fresh machine's first spawn pays
+  // module load + policy-bundle fetch + bind; 4s races that and reports a false
+  // "failed". Override via cfg.healthTimeoutMs.
+  const { guardScript, baseEnv = {}, healthTimeoutMs = 10000, pollMs = 150 } = cfg
   return async function launch(host, port, token) {
     if (await tcpProbe(host, port)) return { outcome: 'in-use' }
+
+    // Tee the daemon's own stdout/stderr to ~/.vaibot/guard/launch.log so a boot
+    // that never turns healthy is diagnosable instead of silently swallowed.
+    const logFd = openLaunchLog()
+    const childStdio = logFd == null ? 'ignore' : ['ignore', logFd, logFd]
 
     let child
     try {
@@ -58,7 +82,7 @@ export function makeLauncher(cfg = {}) {
           VAIBOT_GUARD_TOKEN: token,
         },
         detached: true,
-        stdio: 'ignore',
+        stdio: childStdio,
       })
       child.unref()
     } catch (error) {
@@ -76,7 +100,10 @@ export function makeLauncher(cfg = {}) {
     } catch {
       /* ignore */
     }
-    return { outcome: 'failed', error: new Error('guard did not become healthy within timeout') }
+    return {
+      outcome: 'failed',
+      error: new Error(`guard did not become healthy within ${healthTimeoutMs}ms — see ${LAUNCH_LOG}`),
+    }
   }
 }
 
