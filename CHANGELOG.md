@@ -15,7 +15,10 @@ All notable changes to `@vaibot/claudecode-circuitbreaker-plugin`.
   - **cold start** (fresh install, no rendezvous lock) → **allow-with-audit** so a
     new machine can bootstrap the daemon instead of bricking;
   - **established install** whose lock is present but the daemon is gone and
-    un-relaunchable → **stays fail-closed (deny) + alerts** (possible tampering).
+    un-relaunchable → **stays fail-closed (deny) + alerts** (possible tampering);
+  - a **reachable-but-erroring** guard/endpoint (5xx, decide failure) stays
+    fail-closed — degrade applies only to a truly-absent local daemon, never to an
+    endpoint that responded.
 - Synced vendored `@vaibot/guard` (system-config commands → approval on the command
   head, `policy.default.json` v0.3, launcher boot log + 10s cold-start budget).
 

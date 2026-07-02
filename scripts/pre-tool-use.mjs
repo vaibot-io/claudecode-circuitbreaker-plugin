@@ -199,11 +199,10 @@ function isColdStart() {
 //    possible tampering → stay fail-closed (deny) + alert.
 function applyGuardDownDecision(toolName, toolInput) {
   const verdict = classify({ tool: toolName, input: toolInput })
-  if (verdict.verdictHint === VERDICT.DENY) {
-    emitBreakerDeny(`VAIBot floor (guard offline): ${verdict.reasons?.[0] ?? 'dangerous action'} — blocked.`)
-    return
-  }
-  if (isColdStart()) {
+  const dangerous = verdict.verdictHint === VERDICT.DENY
+  // Cold start (fresh install, no rendezvous lock) + non-catastrophic → degrade to
+  // allow-with-audit so the box can bring the daemon up. Dangerous still denies.
+  if (isColdStart() && !dangerous) {
     process.stderr.write(
       `VAIBot [degraded]: guard not up yet (fresh install) — ${toolName} allowed with audit; ` +
       `catastrophic floor still enforced. If the guard never comes up, see ~/.vaibot/guard/launch.log.\n`,
@@ -211,12 +210,16 @@ function applyGuardDownDecision(toolName, toolInput) {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow' },
     }))
-    return
+    process.exit(0)
   }
-  emitBreakerDeny(
-    `VAIBot: the guard ran on this machine but is now unreachable and could not be relaunched — ` +
-    `denying ${toolName} (possible tampering). See ~/.vaibot/guard/launch.log.`,
+  // Catastrophic floor (any install) OR an established install whose guard is gone
+  // and un-relaunchable (possible tampering) → fail-closed hard deny (exit 2).
+  process.stderr.write(
+    dangerous
+      ? `VAIBot: denying ${toolName} — catastrophic floor (${verdict.reasons?.[0] ?? 'dangerous action'}), enforced with no daemon.\n`
+      : `VAIBot: denying ${toolName} — guard ran here but is now unreachable and un-relaunchable (possible tampering). See ~/.vaibot/guard/launch.log.\n`,
   )
+  process.exit(2)
 }
 
 // ── Fingerprint ────────────────────────────────────────────────────────────
@@ -583,8 +586,8 @@ async function main() {
         saveBreakerSnapshot(breaker.snapshot())
         if (breaker.isTripped()) { applyBreakerTrippedDecision(breaker, toolName, toolInput); process.exit(0) }
         if (FAIL_OPEN || MODE === 'observe') process.exit(0)
-        applyGuardDownDecision(toolName, toolInput)
-        process.exit(0)
+        process.stderr.write(`VAIBot: guard decide failed (${result.status ?? 'network'}) — denying ${toolName}\n`)
+        process.exit(2)
       }
       if (FAIL_OPEN || MODE === 'observe') process.exit(0)
       process.stderr.write(`VAIBot: guard returned ${result.status} — denying ${toolName}\n`)
