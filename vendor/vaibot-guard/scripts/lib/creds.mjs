@@ -196,6 +196,18 @@ function slimRecord(rec) {
   return out
 }
 
+// Host-level guard endpoint (port-as-data). The guard is one-per-host, so its
+// resolved address lives at the TOP LEVEL of the store, not per-env. Validates the
+// port and keeps host + optional token. Returns null for anything malformed.
+function slimGuard(g) {
+  if (!g || typeof g !== 'object') return null
+  const port = Number(g.port)
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null
+  const out = { host: typeof g.host === 'string' && g.host ? g.host : '127.0.0.1', port }
+  if (typeof g.token === 'string' && g.token) out.token = g.token
+  return out
+}
+
 // Pure: normalize any parsed JSON into a v2 store (in memory). Never throws.
 export function migrateStore(raw) {
   if (!raw || typeof raw !== 'object') return emptyStore()
@@ -213,6 +225,9 @@ export function migrateStore(raw) {
         out.environments[e] = slimRecord(rec)
       }
     }
+    // Preserve the host-level guard endpoint across migrations (port-as-data).
+    const g = slimGuard(raw.guard)
+    if (g) out.guard = g
     return out
   }
 
@@ -243,6 +258,27 @@ export function loadStore(opts = {}) {
 export function loadCredsForEnv(envName, opts = {}) {
   const store = opts.store ?? loadStore(opts)
   return store.environments?.[envName] ?? null
+}
+
+// Read the host-level guard endpoint (the durable "assigned" address).
+// Returns { host, port, token? } or null. Clients resolve the LIVE rendezvous
+// (~/.vaibot/guard/guard.json) first and fall back to this — never a hardcoded port.
+export function readGuardEndpoint(opts = {}) {
+  const store = opts.store ?? loadStore(opts)
+  return store.guard ?? null
+}
+
+// Merge-on-write the host-level guard endpoint: re-read the latest store, set ONLY
+// the guard block (validated), atomically replace. Never clobbers env creds.
+export function writeGuardEndpoint(endpoint, opts = {}) {
+  const slim = slimGuard(endpoint)
+  if (!slim) throw new Error('writeGuardEndpoint: endpoint requires an integer { port } in 1..65535')
+  const dir = resolveCredsDir(opts)
+  const path = opts.path ?? credsPath(opts)
+  const store = loadStore({ ...opts, path })
+  store.guard = slim
+  atomicWriteJson(dir, path, store)
+  return slim
 }
 
 function atomicWriteJson(dir, path, value) {

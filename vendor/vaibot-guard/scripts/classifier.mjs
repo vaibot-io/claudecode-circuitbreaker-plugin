@@ -192,20 +192,33 @@ function leadingWord(segment) {
   return norm(tokens[i] ?? '')
 }
 
+// Dynamic Tier-0 (port-as-data): also protect the guard's LIVE bound port, not just
+// the static default already in GUARD_PROTECT_PATTERNS. Given a resolved port, flag a
+// command that both names that port and carries a process-termination verb. No-op
+// when the port is absent/invalid — the static default branch still covers it. The
+// port is coerced to a bounded integer, so it can never inject into the regex.
+function matchesLiveGuardPort(text, port) {
+  const p = Number(port)
+  if (!Number.isInteger(p) || p <= 0 || p > 65535) return false
+  const re = new RegExp(`(?=[\\s\\S]*\\b${p}\\b)(?=[\\s\\S]*\\b(?:kill|pkill|killall|fuser|kill-port)\\b)`, 'i')
+  return re.test(text)
+}
+
 /**
  * Classify a raw shell command string.
  * @param {string} command
  * @param {object} tables
+ * @param {number} [guardPort] live guard port to protect (port-as-data); the default branch covers the static default
  * @returns {{category:string, risk:string, boundary:string, reversible:boolean, reasons:string[]}}
  */
-export function classifyBash(command, tables = defaultTables()) {
+export function classifyBash(command, tables = defaultTables(), guardPort) {
   const reasons = []
   const full = String(command ?? '')
   if (!full.trim()) {
     return { category: CATEGORY.EXEC, risk: RISK.MEDIUM, boundary: BOUNDARY.NONE, reversible: true, reasons: ['empty command'] }
   }
 
-  if (anyMatch(GUARD_PROTECT_PATTERNS, full)) {
+  if (anyMatch(GUARD_PROTECT_PATTERNS, full) || matchesLiveGuardPort(full, guardPort)) {
     return { category: CATEGORY.EXEC, risk: RISK.DANGEROUS, boundary: BOUNDARY.EGRESS, reversible: false, reasons: ['would disable the VAIBot guard (protected: port 39111 / vaibot-guard)'] }
   }
 
@@ -358,7 +371,7 @@ export function classify(call, cfg = {}) {
 
   if (execTools.has(tool)) {
     const command = typeof input === 'string' ? input : input?.command ?? input?.cmd ?? ''
-    const b = classifyBash(command, tables)
+    const b = classifyBash(command, tables, cfg.guardPort)
     return finalize(rawTool, b.category, b.risk, b.boundary, b.reversible, b.reasons, escalateAt)
   }
 

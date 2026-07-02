@@ -13,7 +13,8 @@ import net from 'node:net'
 import { openSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { ensureGuard, httpHealth } from './guard-bootstrap.mjs'
+import { ensureGuard, httpHealth, defaultCandidatePorts } from './guard-bootstrap.mjs'
+import { readGuardEndpoint, writeGuardEndpoint } from './creds.mjs'
 
 // Where the daemon's own boot stdout/stderr is tee'd, so a spawn that never turns
 // healthy leaves a diagnosable trail instead of failing silently.
@@ -120,5 +121,22 @@ export async function ensureGuardDefault(opts = {}) {
     healthTimeoutMs: opts.healthTimeoutMs,
     pollMs: opts.pollMs,
   })
-  return ensureGuard(opts, { launch })
+  // Port-as-data: prefer the persisted (assigned) port so a restart reuses it,
+  // then fall back to the default scan — best-effort, no hardcoded contract.
+  let assigned = null
+  try { assigned = readGuardEndpoint() } catch { /* best-effort */ }
+  let candidatePorts = opts.candidatePorts
+  if (assigned && Number.isInteger(assigned.port)) {
+    const base = candidatePorts ?? defaultCandidatePorts()
+    candidatePorts = [assigned.port, ...base.filter((p) => p !== assigned.port)]
+  }
+
+  const r = await ensureGuard({ ...opts, candidatePorts }, { launch })
+
+  // Persist the resolved endpoint (only when it changed) so the port is remembered
+  // + discoverable via credentials.json — never a hardcoded default.
+  if (r && r.ok && Number.isInteger(r.port) && (r.port !== assigned?.port || r.token !== assigned?.token)) {
+    try { writeGuardEndpoint({ host: r.host, port: r.port, token: r.token }) } catch { /* best-effort */ }
+  }
+  return r
 }
