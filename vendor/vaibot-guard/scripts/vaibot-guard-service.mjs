@@ -20,7 +20,7 @@ import { loadPolicyBundle, effectivePolicy, computeBundleHash, verifyBundle } fr
 import { pickPolicyPubkey } from "./pinned-keys.mjs";
 import { writeLock, readLock, LOCK_FILE } from "./lib/guard-bootstrap.mjs";
 import { loadGuardEnvFile } from "./lib/env-file.mjs";
-import { loadStore, resolveEnv, loadCredsForEnv, governanceBaseForEnv, provenanceBaseForEnv, urlOverrideAllowed, gateUrlOverride } from "./lib/creds.mjs";
+import { loadStore, resolveEnv, loadCredsForEnv, governanceBaseForEnv, provenanceBaseForEnv, urlOverrideAllowed, gateUrlOverride, readGuardEndpoint } from "./lib/creds.mjs";
 
 // One shared guard, one config — regardless of launcher. Under systemd the env is
 // already populated from EnvironmentFile=~/.config/vaibot-guard/vaibot-guard.env;
@@ -34,7 +34,9 @@ if (_envFileKeys.length) {
   console.error(`[vaibot-guard] filled ${_envFileKeys.length} setting(s) from vaibot-guard.env: ${_envFileKeys.join(", ")}`);
 }
 
-const PORT = Number(process.env.VAIBOT_GUARD_PORT || 39111);
+// Port precedence: explicit env (launcher scan / systemd env file) → the persisted
+// credentials.json endpoint → a last-resort default hint. Never a hardcoded contract.
+const PORT = Number(process.env.VAIBOT_GUARD_PORT) || readGuardEndpoint()?.port || 39111;
 const HOST = process.env.VAIBOT_GUARD_HOST || "127.0.0.1";
 
 // ---- API config from the credentials file (v3 split: V2 governance / V1 provenance)
@@ -777,7 +779,7 @@ function decideExec({ sessionId, cmd, args, intent }) {
 
   // D: signed-policy denylist + classifier dangerous-deny (safety floor).
   if (SIGNED_DENYLIST.includes(String(cmd))) return { decision: "deny", reason: "Denied by signed policy denylist" };
-  const clsExec = classify({ tool: "exec", input: { command: joined } }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT });
+  const clsExec = classify({ tool: "exec", input: { command: joined } }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT, guardPort: PORT });
   // floor:true marks the un-overridable catastrophic floor (Tier-0) so clients
   // can enforce it even in observe mode.
   if (clsExec.verdictHint === "deny") return { decision: "deny", reason: `Classifier: ${clsExec.reasons[0] || "dangerous"}`, floor: true };
@@ -948,7 +950,7 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
   // D: signed-policy denylist (safety floor) + classifier dangerous-deny —
   // checked before the guard's own token/rule posture so they can only ADD denies.
   if (SIGNED_DENYLIST.includes(tn)) return { decision: "deny", reason: "Denied by signed policy denylist" };
-  const cls = classify({ tool: toolName, input: params }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT });
+  const cls = classify({ tool: toolName, input: params }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT, guardPort: PORT });
   // floor:true marks the un-overridable catastrophic floor (Tier-0).
   if (cls.verdictHint === "deny") return { decision: "deny", reason: `Classifier: ${cls.reasons[0] || "dangerous"}`, floor: true };
 
