@@ -189,6 +189,19 @@ function isColdStart() {
   }
 }
 
+// The last account posture the guard published into the rendezvous (guard.json). When the
+// guard is down we can't fetch the LIVE account mode, but this tells us what it WAS — so we
+// stay transparent (per the Compromised-Agent Defense Model §9 "make trust posture visible
+// to the operator") when we fail closed over an account deliberately set to observe.
+function lastKnownAccountMode() {
+  try {
+    const m = JSON.parse(readFileSync(join(homedir(), '.vaibot', 'guard', 'guard.json'), 'utf-8'))?.effective_mode
+    return m === 'observe' || m === 'enforce' ? m : null
+  } catch {
+    return null
+  }
+}
+
 // Guard unreachable under enforce → conditioned degrade (NOT a blanket allow):
 //  * the catastrophic floor is enforced LOCALLY in every case (classifier
 //    DANGEROUS → deny), so rm -rf /, guard self-protection, fork bombs, etc. are
@@ -221,9 +234,17 @@ function applyGuardDownDecision(toolName, toolInput) {
   // cold-start+dangerous case (guard never came up, catastrophic tool) also lands here
   // and is floor-denied by applyNoKeyDecision.
   if (!isColdStart()) {
+    // §9 transparency: if the account was deliberately on observe, make the fail-closed
+    // override LOUD so an operator isn't silently surprised when it starts governing.
+    const observeOverride = lastKnownAccountMode() === 'observe' && MODE !== 'observe'
     process.stderr.write(
       `VAIBot [degraded]: guard ran here but is now unreachable — governing locally ` +
-      `(possible tampering; audited). See ~/.vaibot/guard/launch.log.\n`,
+      `(possible tampering; audited).` +
+      (observeOverride
+        ? ` NOTE: this account's posture was 'observe', but the guard is down — VAIBot is ` +
+          `FAILING CLOSED to enforce locally until it recovers (deliberate policy).`
+        : '') +
+      ` See ~/.vaibot/guard/launch.log.\n`,
     )
   }
   applyNoKeyDecision(toolName, toolInput)
