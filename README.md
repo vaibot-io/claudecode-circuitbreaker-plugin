@@ -24,7 +24,15 @@ Most deployments use both: the plugin for mandatory pre-execution enforcement, t
 
 ## Quick start
 
-Install in three steps from inside a Claude Code session:
+**Recommended — install the whole stack in one command.** The `vaibot` CLI is the entry point: it installs the guard, detects and wires your agents (including Claude Code), and sets a policy floor. macOS + Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vaibot-io/command-cli/main/install.sh | sh
+```
+
+### Just the plugin
+
+Or install only the plugin from inside a Claude Code session:
 
 ```text
 # 1. Register the marketplace (clones the GitHub repo into Claude Code's cache)
