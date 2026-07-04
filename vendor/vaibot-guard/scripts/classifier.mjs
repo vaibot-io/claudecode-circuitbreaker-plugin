@@ -121,6 +121,37 @@ const GUARD_PROTECT_PATTERNS = [
   /\bvaibot\s+guard\s+(?:stop|disable|uninstall|remove)\b/i,
 ]
 
+// Destructive host-config verbs → un-overridable HARD-DENY (Phase-3 #4). Stopping,
+// disabling, or masking a service, unloading/removing a launchd job, or wiping/installing
+// a crontab can take down a security service (auditd/firewalld) or plant persistence.
+// Matched on the FULL command so wrapped/absolute/`sh -c` forms are covered too
+// (`/usr/bin/systemctl disable auditd`, `sh -c 'crontab job'`), and because the verdict is
+// DANGEROUS it can't be downgraded to ask by any signed preset. Benign system-config
+// (status/list/-l) is NOT matched here and stays on the ask lane (SYSTEM_CONFIG_CMDS below).
+const SYSTEM_CONFIG_DENY_PATTERNS = [
+  /\bsystemctl\b[^|&;\n]*\b(stop|disable|mask|kill)\b/i,
+  /\bservice\b\s+\S+\s+(stop|force-reload)\b/i,
+  /\blaunchctl\b[^|&;\n]*\b(unload|remove|bootout|disable)\b/i,
+  // crontab -r (wipe all), crontab - (install from stdin), crontab <file> (install); -l/-e stay on ask
+  /\bcrontab\b\s+(?:-u\s+\S+\s+)?(-r\b|-(?:\s|$)|[^\-\s]\S*)/i,
+]
+
+// The guard's OWN forward lifecycle → ALLOW (no prompt). Checked AFTER the self-protection +
+// destructive-verb denies, so stop/disable/mask/unload/bootout/uninstall of the guard still
+// hard-DENY. Each form is anchored (^…$) and rejects shell metacharacters so a chained /
+// injected action can't ride along; any teardown verb also disqualifies. Covers systemd
+// (Linux) AND launchctl (macOS, label io.vaibot.guard) plus the guard CLI/launcher and the
+// localhost :39111 health probe — so an agent can start/inspect/health-check/(re)install the
+// guard it runs under without a prompt.
+const GUARD_TEARDOWN_VERBS = /\b(?:stop|disable|mask|unload|remove|bootout|uninstall|kill|purge)\b/i
+const GUARD_LIFECYCLE_ALLOW = [
+  /^(?:sudo\s+)?systemctl(?:\s+--user)?\s+(?:start|status|restart|enable|reload|is-active|is-enabled|show|cat)(?:\s+--now)?\s+vaibot-guard(?:-service)?(?:\.service)?\s*$/i,
+  /^(?:sudo\s+)?launchctl\s+(?:load|list|start|kickstart|enable|bootstrap|print|blame)\s[^|&;<>`$()]*(?:io\.vaibot\.guard|vaibot-guard)[^|&;<>`$()]*$/i,
+  /^(?:sudo\s+)?service\s+vaibot-guard(?:-service)?\s+(?:start|status|restart|reload)\s*$/i,
+  /^(?:sudo\s+)?(?:node\s+\S*)?vaibot-guard(?:-service)?(?:\.mjs)?(?:\s+[\w:@%./=+-]+)*\s*$/i,
+  /^(?:sudo\s+)?(?:curl|wget)\s[^|&;<>`$()]*(?:127\.0\.0\.1|localhost):39111[^|&;<>`$()]*$/i,
+]
+
 // Elevated-risk patterns → HIGH (ask). Recoverable-but-consequential.
 const HIGH_PATTERNS = [
   /\bsudo\b/i,
@@ -144,6 +175,14 @@ const SENSITIVE_PATTERNS = [
   /\.git-credentials\b/i, /private[_-]?key/i, /\.pem\b/i, /credentials\.json\b/i,
   /\.kube\/config\b/i, /\bprintenv\b/i,
 ]
+
+// System-config command HEADS → HIGH (ask). Managing host schedulers / process
+// supervisors is consequential-but-reversible, so it takes human approval rather
+// than a hard deny — this lets operators manage them under approval AND lets a
+// fresh install bootstrap the guard's own unit under approval instead of being
+// hard-blocked. Matched on the command HEAD (leadingWord) only, so the same word
+// appearing as an argument ("restart the foo service") is NOT escalated.
+const SYSTEM_CONFIG_CMDS = new Set(['systemctl', 'service', 'launchctl', 'crontab', 'cron'])
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -184,25 +223,49 @@ function leadingWord(segment) {
   return norm(tokens[i] ?? '')
 }
 
+// Dynamic Tier-0 (port-as-data): also protect the guard's LIVE bound port, not just
+// the static default already in GUARD_PROTECT_PATTERNS. Given a resolved port, flag a
+// command that both names that port and carries a process-termination verb. No-op
+// when the port is absent/invalid — the static default branch still covers it. The
+// port is coerced to a bounded integer, so it can never inject into the regex.
+function matchesLiveGuardPort(text, port) {
+  const p = Number(port)
+  if (!Number.isInteger(p) || p <= 0 || p > 65535) return false
+  const re = new RegExp(`(?=[\\s\\S]*\\b${p}\\b)(?=[\\s\\S]*\\b(?:kill|pkill|killall|fuser|kill-port)\\b)`, 'i')
+  return re.test(text)
+}
+
 /**
  * Classify a raw shell command string.
  * @param {string} command
  * @param {object} tables
+ * @param {number} [guardPort] live guard port to protect (port-as-data); the default branch covers the static default
  * @returns {{category:string, risk:string, boundary:string, reversible:boolean, reasons:string[]}}
  */
-export function classifyBash(command, tables = defaultTables()) {
+export function classifyBash(command, tables = defaultTables(), guardPort) {
   const reasons = []
   const full = String(command ?? '')
   if (!full.trim()) {
     return { category: CATEGORY.EXEC, risk: RISK.MEDIUM, boundary: BOUNDARY.NONE, reversible: true, reasons: ['empty command'] }
   }
 
-  if (anyMatch(GUARD_PROTECT_PATTERNS, full)) {
+  if (anyMatch(GUARD_PROTECT_PATTERNS, full) || matchesLiveGuardPort(full, guardPort)) {
     return { category: CATEGORY.EXEC, risk: RISK.DANGEROUS, boundary: BOUNDARY.EGRESS, reversible: false, reasons: ['would disable the VAIBot guard (protected: port 39111 / vaibot-guard)'] }
   }
 
   if (anyMatch(DENY_PATTERNS, full)) {
     return { category: CATEGORY.EXEC, risk: RISK.DANGEROUS, boundary: BOUNDARY.EGRESS, reversible: false, reasons: ['matches destructive pattern'] }
+  }
+
+  if (anyMatch(SYSTEM_CONFIG_DENY_PATTERNS, full)) {
+    return { category: CATEGORY.EXEC, risk: RISK.DANGEROUS, boundary: BOUNDARY.EGRESS, reversible: false, reasons: ['destructive host-config verb (stop/disable/unload/mask or crontab install)'] }
+  }
+
+  // The guard's OWN forward lifecycle (manage the guard I run under) → ALLOW. Reached only
+  // after the denies above, so teardown of the guard still hard-DENY; a teardown verb or any
+  // shell chaining disqualifies (see GUARD_LIFECYCLE_ALLOW).
+  if (!GUARD_TEARDOWN_VERBS.test(full) && anyMatch(GUARD_LIFECYCLE_ALLOW, full)) {
+    return { category: CATEGORY.EXEC, risk: RISK.SAFE, boundary: BOUNDARY.NONE, reversible: true, reasons: ['vaibot-guard own lifecycle command'] }
   }
 
   let risk = RISK.SAFE
@@ -248,6 +311,14 @@ export function classifyBash(command, tables = defaultTables()) {
         reversible = false
         reasons.push(`git mutating: ${sub || '(none)'}`)
       }
+    } else if (SYSTEM_CONFIG_CMDS.has(cmd)) {
+      // Host scheduler / process-supervisor management → HIGH ⇒ ask (approval),
+      // never a hard deny. Command-head only (see SYSTEM_CONFIG_CMDS note).
+      category = CATEGORY.EXEC
+      boundary = unionBoundary(boundary, BOUNDARY.EGRESS)
+      risk = maxRisk(risk, RISK.HIGH)
+      reversible = false
+      reasons.push(`system-config command (approval): ${cmd}`)
     } else if (write.has(cmd)) {
       category = CATEGORY.WRITE
       boundary = unionBoundary(boundary, BOUNDARY.EGRESS)
@@ -342,7 +413,7 @@ export function classify(call, cfg = {}) {
 
   if (execTools.has(tool)) {
     const command = typeof input === 'string' ? input : input?.command ?? input?.cmd ?? ''
-    const b = classifyBash(command, tables)
+    const b = classifyBash(command, tables, cfg.guardPort)
     return finalize(rawTool, b.category, b.risk, b.boundary, b.reversible, b.reasons, escalateAt)
   }
 

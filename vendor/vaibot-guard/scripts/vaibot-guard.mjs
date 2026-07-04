@@ -236,6 +236,116 @@ async function maybeOnboard() {
   }
 }
 
+// Poll GET /health until healthy or timeout. Used to gate a service install.
+// Poll GET /health until healthy or timeout. `ownership` = { sinceMs, readLock }: when
+// given, additionally require the rendezvous (guard.json) to show OUR freshly-started
+// instance on this exact port — i.e. an instance that started at/after the install began.
+// That distinguishes "the unit WE just started answered" from "a stale/foreign guard
+// already squatting this port answered while our unit crash-loops behind it" — WITHOUT
+// authenticating /health. Without `ownership`, it's a plain unauthenticated /health check.
+async function pollGuardHealth(port, timeoutMs, ownership = null) {
+  const token = getConfig("VAIBOT_GUARD_TOKEN", "");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`http://${GUARD_HOST}:${port}/health`, {
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+        signal: AbortSignal.timeout(1000),
+      });
+      if (res.ok) {
+        const body = await res.json().catch(() => ({}));
+        const alive = !!(body && body.ok === true);
+        if (alive && !ownership) return true;
+        if (alive && ownership) {
+          const lock = ownership.readLock();
+          const owned =
+            lock &&
+            Number(lock.port) === Number(port) &&
+            (Number(lock.startedAt) || 0) >= ownership.sinceMs;
+          if (owned) return true;
+        }
+      }
+    } catch { /* not up yet */ }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return false;
+}
+
+// `vaibot-guard install` — non-interactive, platform-aware service install. Walks the
+// root-preferred ladder (systemd / launchd / self-spawn) via installGuardService, writes
+// + starts the best available tier, then health-verifies. `--system` opts into the
+// root/sudo tamper-boundary tier. Exits 0 on healthy (or self-spawn), 1 on trouble.
+async function cmdInstall() {
+  const [{ installGuardService }, { readGuardEndpoint, writeGuardEndpoint }, { readLock }] = await Promise.all([
+    import("./lib/guard-install.mjs"),
+    import("./lib/creds.mjs"),
+    import("./lib/guard-bootstrap.mjs"),
+  ]);
+  const serviceScript = path.join(path.dirname(fileURLToPath(import.meta.url)), "vaibot-guard-service.mjs");
+
+  // Ensure a token + env file exist before the supervisor loads them.
+  ensureGuardToken(ENV_FILE);
+
+  const useSystem = flags["system"] === true || flags["system"] === "true";
+  // launchd runs with CWD=/ and no stdout — set a working dir so the guard's default
+  // workspace is sane, and capture stdout/stderr so a startup crash is visible.
+  const guardDir = path.join(os.homedir(), ".vaibot", "guard");
+  try { fs.mkdirSync(guardDir, { recursive: true }); } catch { /* best-effort */ }
+
+  // Pin + persist the endpoint so the unit, the health-verify, and every client agree on
+  // ONE port — never a bare default a foreign guard might already hold. Record the install
+  // start so the health-verify can confirm OUR fresh unit (not a stale process) took over.
+  const guardPort = readGuardEndpoint()?.port ?? GUARD_PORT;
+  try { writeGuardEndpoint({ host: GUARD_HOST, port: guardPort }); } catch { /* best-effort */ }
+  const installStart = Date.now();
+
+  const res = await installGuardService({
+    execStart: `/usr/bin/env node ${serviceScript}`,
+    programArgs: [process.execPath, serviceScript],
+    envFile: ENV_FILE,
+    envVars: { VAIBOT_GUARD_ENV_FILE: ENV_FILE, VAIBOT_GUARD_PORT: String(guardPort) },
+    workingDir: os.homedir(),
+    stdout: path.join(guardDir, "launchd.out.log"),
+    stderr: path.join(guardDir, "launchd.err.log"),
+    uid: typeof process.getuid === "function" ? process.getuid() : undefined,
+    canSudo: useSystem,
+  });
+
+  if (res.selfSpawn) {
+    const { detectContainer, detectCI, commandExists } = await import("./lib/guard-supervisor.mjs");
+    const why = [];
+    if (detectContainer()) why.push("container detected");
+    if (detectCI()) why.push("CI environment detected (a CI_* env var is set)");
+    if (process.platform === "darwin" && !commandExists("launchctl")) why.push("launchctl not on PATH");
+    else if (process.platform === "linux" && !commandExists("systemctl")) why.push("systemctl not on PATH");
+    else if (process.platform !== "darwin" && process.platform !== "linux") why.push(`unsupported platform '${process.platform}'`);
+    console.log(`[vaibot-guard] No managed service tier selected — reason: ${why.join("; ") || "unknown (platform " + process.platform + ")"}.`);
+    console.log("[vaibot-guard] Self-spawning on the first agent tool call instead — governance is still enforced, just not auto-started at boot.");
+    process.exit(0);
+  }
+  if (!res.ok) {
+    console.error(`[vaibot-guard] Service install failed (${res.tier} tier): ${res.error || "unknown"}`);
+    console.error("[vaibot-guard] The guard falls back to self-spawn on the next tool call. See ~/.vaibot/guard/launch.log.");
+    process.exit(1);
+  }
+  console.log(`[vaibot-guard] Installed + started as a ${res.tier}-scope service.`);
+
+  // Verify OUR freshly-started unit is actually serving on the pinned port — not a stale
+  // guard already squatting it while our unit crash-loops behind it (no /health gating;
+  // the ownership check reads the rendezvous startedAt).
+  const healthy = await pollGuardHealth(guardPort, 8000, { sinceMs: installStart, readLock });
+  if (healthy) {
+    console.log(`[vaibot-guard] Healthy on ${GUARD_HOST}:${guardPort}.`);
+    process.exit(0);
+  }
+  console.error(
+    `[vaibot-guard] WARN: the service did not take over ${GUARD_HOST}:${guardPort} within 8s ` +
+    "(crash-loop, or another guard already holds the port). Check `systemctl --user status " +
+    "vaibot-guard`, ~/.vaibot/guard/launchd.err.log, and stop any stray guard, then retry.",
+  );
+  process.exit(1);
+}
+
 async function cmdInstallLocal() {
   if (!process.stdin.isTTY) {
     die("install-local requires a TTY");
@@ -395,6 +505,10 @@ async function cmdConfigure() {
   } finally {
     rl.close();
   }
+}
+
+if (command === "install") {
+  await cmdInstall();
 }
 
 if (command === "install-local") {

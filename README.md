@@ -69,20 +69,22 @@ VAIBot [observe]: Bash would be denial — command writes outside workspace.
 
 ## Modes
 
-### Observe (default)
+The **effective mode is resolved by the guard from your account** and wins whenever the guard is reachable. `VAIBOT_MODE` is the **local fallback**, used only before the guard has answered — and it defaults to **`enforce`**.
 
-All tool calls are allowed. The governance verdict is logged but never enforced. Use this to audit your agent's behaviour before enabling enforcement.
+### Enforce (default)
 
-```bash
-export VAIBOT_MODE=observe
-```
-
-### Enforce
-
-Tool calls are blocked when the policy returns `deny` or `approval_required`. The agent sees the policy reason.
+Tool calls are blocked when the policy returns `deny`, and routed to Claude Code's native approval prompt when it returns `approval_required`. The agent sees the policy reason.
 
 ```bash
 export VAIBOT_MODE=enforce
+```
+
+### Observe
+
+All tool calls proceed; the governance verdict is logged to stderr but never enforced (**except the catastrophic floor**). Use it to audit your agent — and as the **escape hatch** if enforcement ever blocks you (see [Recovery / escape hatch](#recovery--escape-hatch)).
+
+```bash
+export VAIBOT_MODE=observe
 ```
 
 ## Auto-bootstrap
@@ -96,6 +98,39 @@ VAIBot: account exists but API key not found locally.
 ```
 
 To claim your account and approve actions from the dashboard, visit the URL printed on first run or run `/vaibot status`.
+
+### No API key never bricks the agent
+
+A missing or unprovisionable key does **not** fail-closed. If `/v2/bootstrap` can't mint one (the account already exists and the local key was lost, or the endpoint is unreachable), the plugin **governs locally** with the built-in classifier:
+
+- **safe** tools run,
+- **risky** tools route to Claude Code's native approval prompt (no key needed),
+- the **catastrophic floor** still denies (filesystem-root/home wipes, guard self-protection, fork bombs, …).
+
+Server-backed receipts are skipped until a key is restored, so a fresh or key-lost machine keeps working — and can always recover itself.
+
+## Recovery / escape hatch
+
+If enforcement ever blocks you and you need out **now**:
+
+```bash
+# Instant escape: relaunch Claude Code in observe mode (allows all but the floor).
+# This is a LOCAL offline fallback — it does NOT weaken enforcement once the guard
+# is reachable and you have a key again.
+VAIBOT_MODE=observe claude
+```
+
+`/plugin` commands are slash commands, not tool calls, so you can update/reinstall the plugin even mid-block:
+
+```
+/plugin marketplace update vaibot-claudecode
+/reload-plugins
+```
+
+To restore full (server-backed) governance, get a key back — any one:
+- `vaibot login` (allowed — it's a safe tool),
+- copy your key from **https://www.vaibot.io** → `export VAIBOT_API_KEY=vb_…`,
+- or check `~/.vaibot/credentials.json`.
 
 ## Slash commands
 

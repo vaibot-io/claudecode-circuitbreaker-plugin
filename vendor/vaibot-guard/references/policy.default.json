@@ -1,14 +1,13 @@
 {
-  "version": "0.2",
-  "_notes": "Minimal Tier-1 floor: outbound network + privilege + core secrets ASK; only system-config commands hard-deny. Installers are preset-controlled (allowed by default; Balanced/Strict escalate via signed approveTokens). Signed preset bundles tighten this via deny/approveTokens.",
-  "denyTokens": [
+  "version": "0.3",
+  "_notes": "Minimal Tier-1 floor: outbound network + privilege + core secrets + system-config commands all ASK (human approval, NOT hard-deny) so operators can manage schedulers and host process supervisors under approval and fresh-install bootstrap is not blocked. Only the classifier's catastrophic pattern floor (rm -rf /, mkfs, fork bomb, guard self-protection, ...) hard-denies. Installers are preset-controlled (allowed by default; Balanced/Strict escalate via signed approveTokens). Signed preset bundles tighten this via deny/approveTokens.",
+  "denyTokens": [],
+  "approveTokens": [
     "systemctl",
     "service",
     "launchctl",
     "crontab",
-    "cron"
-  ],
-  "approveTokens": [
+    "cron",
     "curl",
     "wget",
     "ssh",
