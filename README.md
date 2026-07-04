@@ -1,5 +1,7 @@
 # VAIBot Governance Plugin for Claude Code
 
+[![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/mc2HuR2kgG)
+
 A Claude Code plugin that intercepts every tool call, evaluates it against your governance policy, and enforces the decision before execution proceeds.
 
 VAIBot classifies each tool call by risk and returns an allow, deny, or approval-required verdict. Every decision creates a tamper-evident receipt with on-chain provenance anchoring. The plugin works with zero configuration — a free account is provisioned automatically on first run.
@@ -36,12 +38,6 @@ Install in three steps from inside a Claude Code session:
 ```
 
 The plugin lands at `~/.claude/plugins/cache/.../vaibot-governance/<version>/` (e.g. `0.2.2/`). On first tool call the plugin auto-bootstraps a free-tier VAIBot account using a machine fingerprint and saves credentials to `~/.vaibot/credentials.json`.
-
-For local development you can also load the plugin directly from this checkout without going through the marketplace:
-
-```bash
-claude --plugin-dir /path/to/claudecode-circuitbreaker-plugin
-```
 
 ## What you see at runtime
 
@@ -208,7 +204,7 @@ Tools prefixed with `mcp__vaibot` are skipped automatically to prevent the gover
 
 ## Community & support
 
-**[Join the VAIBot Discord](https://discord.gg/mSHYtP5nV)** — get help, share feedback, and connect with other users.
+**[Join the VAIBot Discord](https://discord.gg/mc2HuR2kgG)** — get help, share feedback, and connect with other users.
 
 VAIBot is in early access. If you're installing this plugin now, you're among the first developers putting verifiable AI governance into production. Early community members shape the roadmap directly — feature requests, policy design, and integration patterns all come from conversations in Discord.
 
@@ -220,4 +216,4 @@ To become a founding member, join the Discord and introduce yourself in **#found
 
 ## Uninstall
 
-Remove the plugin path from `.claude/plugins.json` or stop passing `--plugin-dir`. No state is written outside `~/.vaibot/` and a system temp directory (`/tmp/vaibot-claudecode/`).
+Uninstall with `/plugin uninstall vaibot-governance@vaibot-claudecode`. No state is written outside `~/.vaibot/` and a system temp directory (`/tmp/vaibot-claudecode/`).
