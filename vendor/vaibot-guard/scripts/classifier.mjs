@@ -121,6 +121,37 @@ const GUARD_PROTECT_PATTERNS = [
   /\bvaibot\s+guard\s+(?:stop|disable|uninstall|remove)\b/i,
 ]
 
+// Destructive host-config verbs → un-overridable HARD-DENY (Phase-3 #4). Stopping,
+// disabling, or masking a service, unloading/removing a launchd job, or wiping/installing
+// a crontab can take down a security service (auditd/firewalld) or plant persistence.
+// Matched on the FULL command so wrapped/absolute/`sh -c` forms are covered too
+// (`/usr/bin/systemctl disable auditd`, `sh -c 'crontab job'`), and because the verdict is
+// DANGEROUS it can't be downgraded to ask by any signed preset. Benign system-config
+// (status/list/-l) is NOT matched here and stays on the ask lane (SYSTEM_CONFIG_CMDS below).
+const SYSTEM_CONFIG_DENY_PATTERNS = [
+  /\bsystemctl\b[^|&;\n]*\b(stop|disable|mask|kill)\b/i,
+  /\bservice\b\s+\S+\s+(stop|force-reload)\b/i,
+  /\blaunchctl\b[^|&;\n]*\b(unload|remove|bootout|disable)\b/i,
+  // crontab -r (wipe all), crontab - (install from stdin), crontab <file> (install); -l/-e stay on ask
+  /\bcrontab\b\s+(?:-u\s+\S+\s+)?(-r\b|-(?:\s|$)|[^\-\s]\S*)/i,
+]
+
+// The guard's OWN forward lifecycle → ALLOW (no prompt). Checked AFTER the self-protection +
+// destructive-verb denies, so stop/disable/mask/unload/bootout/uninstall of the guard still
+// hard-DENY. Each form is anchored (^…$) and rejects shell metacharacters so a chained /
+// injected action can't ride along; any teardown verb also disqualifies. Covers systemd
+// (Linux) AND launchctl (macOS, label io.vaibot.guard) plus the guard CLI/launcher and the
+// localhost :39111 health probe — so an agent can start/inspect/health-check/(re)install the
+// guard it runs under without a prompt.
+const GUARD_TEARDOWN_VERBS = /\b(?:stop|disable|mask|unload|remove|bootout|uninstall|kill|purge)\b/i
+const GUARD_LIFECYCLE_ALLOW = [
+  /^(?:sudo\s+)?systemctl(?:\s+--user)?\s+(?:start|status|restart|enable|reload|is-active|is-enabled|show|cat)(?:\s+--now)?\s+vaibot-guard(?:-service)?(?:\.service)?\s*$/i,
+  /^(?:sudo\s+)?launchctl\s+(?:load|list|start|kickstart|enable|bootstrap|print|blame)\s[^|&;<>`$()]*(?:io\.vaibot\.guard|vaibot-guard)[^|&;<>`$()]*$/i,
+  /^(?:sudo\s+)?service\s+vaibot-guard(?:-service)?\s+(?:start|status|restart|reload)\s*$/i,
+  /^(?:sudo\s+)?(?:node\s+\S*)?vaibot-guard(?:-service)?(?:\.mjs)?(?:\s+[\w:@%./=+-]+)*\s*$/i,
+  /^(?:sudo\s+)?(?:curl|wget)\s[^|&;<>`$()]*(?:127\.0\.0\.1|localhost):39111[^|&;<>`$()]*$/i,
+]
+
 // Elevated-risk patterns → HIGH (ask). Recoverable-but-consequential.
 const HIGH_PATTERNS = [
   /\bsudo\b/i,
@@ -224,6 +255,17 @@ export function classifyBash(command, tables = defaultTables(), guardPort) {
 
   if (anyMatch(DENY_PATTERNS, full)) {
     return { category: CATEGORY.EXEC, risk: RISK.DANGEROUS, boundary: BOUNDARY.EGRESS, reversible: false, reasons: ['matches destructive pattern'] }
+  }
+
+  if (anyMatch(SYSTEM_CONFIG_DENY_PATTERNS, full)) {
+    return { category: CATEGORY.EXEC, risk: RISK.DANGEROUS, boundary: BOUNDARY.EGRESS, reversible: false, reasons: ['destructive host-config verb (stop/disable/unload/mask or crontab install)'] }
+  }
+
+  // The guard's OWN forward lifecycle (manage the guard I run under) → ALLOW. Reached only
+  // after the denies above, so teardown of the guard still hard-DENY; a teardown verb or any
+  // shell chaining disqualifies (see GUARD_LIFECYCLE_ALLOW).
+  if (!GUARD_TEARDOWN_VERBS.test(full) && anyMatch(GUARD_LIFECYCLE_ALLOW, full)) {
+    return { category: CATEGORY.EXEC, risk: RISK.SAFE, boundary: BOUNDARY.NONE, reversible: true, reasons: ['vaibot-guard own lifecycle command'] }
   }
 
   let risk = RISK.SAFE

@@ -771,6 +771,19 @@ function classifyRisk({ intent, cmd, args }) {
   return { risk: "low", reason: "no high-risk signals" };
 }
 
+// Map the fine-grained classifier risk (safe/low/medium/high/dangerous) and the coarse
+// structural risk (low/high) onto the receipt's risk_level scale, taking the HIGHER of the
+// two. This keeps risk_level consistent with the decision: a gated command carries the
+// classifier's medium/high, a structural hit (network/file) carries high — so "low" on a
+// receipt genuinely means the action was allowed as safe, never a gated action mislabeled.
+function mergeReceiptRisk(coarse, classifierRisk) {
+  const N = { safe: 0, low: 0, medium: 1, high: 2, critical: 3, dangerous: 3 };
+  const LEVELS = ["low", "medium", "high", "critical"];
+  const c = N[String(coarse ?? "low").toLowerCase()] ?? 0;
+  const k = classifierRisk != null ? (N[String(classifierRisk).toLowerCase()] ?? 0) : 0;
+  return LEVELS[Math.max(0, Math.min(3, Math.max(c, k)))];
+}
+
 function decideExec({ sessionId, cmd, args, intent }) {
   const err = validateIntent(intent);
   if (err) return { decision: "deny", reason: err };
@@ -844,10 +857,11 @@ function decideExec({ sessionId, cmd, args, intent }) {
   // caught above) escalates to human approval rather than being silently allowed
   // — matching the offline breaker, which denies the same input.
   if (clsExec.verdictHint === "allow") {
-    return { decision: "allow", reason: "Allowed by baseline policy" };
+    return { decision: "allow", reason: "Allowed by baseline policy", risk: clsExec.risk };
   }
   return {
     decision: "approve",
+    risk: clsExec.risk,
     reason: `Escalated for approval (${clsExec.risk}): ${clsExec.reasons?.[0] || "unrecognized command"}`,
     approvalId: `appr_${randomUUID()}`,
   };
@@ -1014,10 +1028,11 @@ function decideTool({ sessionId, toolName, params, workspaceDir }) {
   // Unknown / unrecognized / third-party (mcp__*) tools the classifier rates ask
   // escalate to human approval rather than being silently allowed.
   if (cls.verdictHint === "allow") {
-    return { decision: "allow", reason: "Allowed by baseline tool policy" };
+    return { decision: "allow", reason: "Allowed by baseline tool policy", risk: cls.risk };
   }
   return {
     decision: "approve",
+    risk: cls.risk,
     reason: `Escalated for approval (${cls.risk}): ${cls.reasons?.[0] || "unrecognized tool"}`,
     approvalId: `appr_${randomUUID()}`,
   };
@@ -1093,8 +1108,12 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
   // Map guard decision names to governance receipt decision names
   const mappedDecision = guardDecision === "approve" ? "approval_required" : guardDecision;
 
-  const riskRaw = String(risk?.risk || "low");
-  const riskLevel = ["low", "medium", "high", "critical"].includes(riskRaw) ? riskRaw : "low";
+  // Receipt honesty: report the risk the DECISION engine actually saw. `risk` is the coarse
+  // structural detector (network/file/curl/secret → high); `decision.risk` is the fine-grained
+  // classifier verdict that DROVE the gate. Merge them so risk_level ALWAYS matches the action
+  // — a gated command is never labeled "low", and a genuinely-safe (classifier-allow) one
+  // stays low. This ends the "low-risk but gated" receipts.
+  const riskLevel = mergeReceiptRisk(risk?.risk, decision?.risk);
 
   const approvalStatus = guardDecision === "approve" ? "pending" : "not_required";
 
@@ -1105,13 +1124,16 @@ function postGovernanceReceipt({ runId, sessionId, intent, decision, risk, resul
   const signedPolicyVersion =
     SIGNED_POLICY?.source === "bundle" ? (POLICY_BUNDLE?.bundle?.version ?? null) : null;
 
+  // Honesty: an ALLOW means the guard permitted the action. At PRECHECK there is no result
+  // yet (result == null), so it is "allowed" — previously `result?.code !== 0` was true for a
+  // null result, so every allowed action's precheck receipt read "blocked". Only downgrade to
+  // "blocked" when a result is present AND the action actually failed (a finalize receipt).
   let outcome = "blocked";
   if (guardDecision === "allow") {
-    outcome = (result?.ok === false || result?.code !== 0) ? "blocked" : "allowed";
+    const failed = result != null && (result.ok === false || (result.code != null && result.code !== 0));
+    outcome = failed ? "blocked" : "allowed";
   } else if (guardDecision === "approve") {
     outcome = "blocked_until_approved";
-  } else {
-    outcome = "blocked";
   }
 
   const agentId = String(sessionId || "unknown-session");
@@ -1669,6 +1691,14 @@ const server = http.createServer(async (req, res) => {
       const risk = classifyRisk({ intent, cmd, args });
       const receiptTier = receiptTierForExec(cmd, args);
       const decision = decideExec({ sessionId, cmd, args, intent });
+      // Receipt honesty: fold the fine-grained classifier's risk into the coarse structural
+      // risk so risk_level reflects what actually drove the gate on EVERY decision path
+      // (approveToken / deny-token / catastrophic-floor), not only the allow/escalate
+      // returns. Same classify() inputs as decideExec, so risk matches the decision.
+      try {
+        const clsRisk = classify({ tool: "exec", input: { command: [cmd, ...(args || [])].join(" ") } }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT, guardPort: PORT }).risk;
+        risk.risk = mergeReceiptRisk(risk.risk, clsRisk);
+      } catch { /* keep coarse risk on classifier error */ }
       const runId = `run_${randomUUID()}`;
 
       const eventId = randomUUID();
@@ -1758,6 +1788,13 @@ const server = http.createServer(async (req, res) => {
 
       const risk = classifyToolRisk({ toolName, params, workspaceDir });
       const receiptTier = receiptTierForTool(toolName, params);
+      // Receipt honesty: fold the fine-grained classifier's risk into the coarse tool risk
+      // so risk_level matches the decision on every path (see the exec handler note). Same
+      // classify() inputs as decideTool.
+      try {
+        const clsRisk = classify({ tool: toolName, input: params }, { tables: CLASSIFIER_TABLES, escalateAt: SIGNED_ESCALATE_AT, guardPort: PORT }).risk;
+        risk.risk = mergeReceiptRisk(risk.risk, clsRisk);
+      } catch { /* keep coarse risk on classifier error */ }
 
       const paramsHash = `sha256:${sha256(stableStringify({ toolName, params }))}`;
       const approvalId = String(input?.approval?.approvalId || "");
