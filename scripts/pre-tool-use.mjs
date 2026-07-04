@@ -212,14 +212,22 @@ function applyGuardDownDecision(toolName, toolInput) {
     }))
     process.exit(0)
   }
-  // Catastrophic floor (any install) OR an established install whose guard is gone
-  // and un-relaunchable (possible tampering) → fail-closed hard deny (exit 2).
-  process.stderr.write(
-    dangerous
-      ? `VAIBot: denying ${toolName} — catastrophic floor (${verdict.reasons?.[0] ?? 'dangerous action'}), enforced with no daemon.\n`
-      : `VAIBot: denying ${toolName} — guard ran here but is now unreachable and un-relaunchable (possible tampering). See ~/.vaibot/guard/launch.log.\n`,
-  )
-  process.exit(2)
+  // Established install (rendezvous lock present) but the guard is gone: possibly
+  // tampering, so ALERT — but do NOT brick the agent. A normal reboot/crash lands here
+  // too (guard.json survives, a self-spawned daemon does not), and the recovery path
+  // (`vaibot login`) MUST stay reachable in-agent. Govern LOCALLY via the classifier —
+  // classifier-safe passes (recovery + normal work continue), risky prompts, the
+  // catastrophic floor still hard-denies — the same posture as the keyless path. The
+  // cold-start+dangerous case (guard never came up, catastrophic tool) also lands here
+  // and is floor-denied by applyNoKeyDecision.
+  if (!isColdStart()) {
+    process.stderr.write(
+      `VAIBot [degraded]: guard ran here but is now unreachable — governing locally ` +
+      `(possible tampering; audited). See ~/.vaibot/guard/launch.log.\n`,
+    )
+  }
+  applyNoKeyDecision(toolName, toolInput)
+  process.exit(0)
 }
 
 // No usable API key (bootstrap can't provision one — e.g. the account already exists
