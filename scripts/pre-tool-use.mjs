@@ -339,10 +339,13 @@ async function bootstrap() {
   }
 
   if (data.bootstrapped === false) {
-    // Already provisioned but we lost the key — tell the user
+    // Account exists but the local key was lost. Offer BOTH recovery paths —
+    // both are valid: `vaibot login` re-issues a key via your session, or set
+    // the key manually if you have it elsewhere.
     process.stderr.write(
-      `VAIBot: account exists but API key not found locally.\n` +
-      `  Check ${CREDS_FILE} or set VAIBOT_API_KEY manually.\n`
+      `VAIBot: account exists but no API key found locally. To recover access, either:\n` +
+      `  • run \`vaibot login\`  — re-issues a key for your account, or\n` +
+      `  • set VAIBOT_API_KEY / check ${CREDS_FILE}  — if you have the key elsewhere.\n`
     )
     return null
   }
