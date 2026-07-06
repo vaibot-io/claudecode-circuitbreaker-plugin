@@ -2,6 +2,14 @@
 
 All notable changes to `@vaibot/claudecode-circuitbreaker-plugin`.
 
+## [1.2.0] — 2026-07-05 — account key recovery
+
+### Changed
+- On `bootstrapped:false` (account exists but no local API key — e.g. the key was
+  lost), the plugin now presents **both** recovery paths instead of a dead end:
+  run `vaibot login` (re-issues a key via your session) **or** set `VAIBOT_API_KEY` /
+  check `credentials.json`. Both are valid; neither replaces the other.
+
 ## [1.1.0] — 2026-07-04 — fresh-install, graceful degrade & honest receipts
 
 ### Changed
