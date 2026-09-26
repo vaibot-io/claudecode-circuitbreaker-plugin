@@ -66,6 +66,14 @@ export interface ClassifyResult {
   reasons: string[]
 }
 
+export type ToolKind = 'exec' | 'read' | 'write' | 'search' | 'network'
+
+/** Active tables first, then the built-in host vocabulary; null when unrecognised. */
+export function toolKind(tool: string, tables?: ClassifierTables): ToolKind | null
+/** The command with its data payloads removed: heredoc bodies that are written
+ *  rather than executed, search patterns, and request bodies. What the floor
+ *  inspects, so prose about a dangerous command is not treated as one. */
+export function commandForMatching(command: string): string
 export function classifyBash(command: string, tables?: ClassifierTables): BashClassification
 export function verdictForRisk(risk: Risk): Verdict
 export function receiptTierFor(risk: Risk, boundary: Boundary): ReceiptTier

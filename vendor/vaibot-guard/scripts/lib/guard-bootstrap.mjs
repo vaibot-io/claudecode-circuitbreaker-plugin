@@ -22,12 +22,18 @@
 
 import { readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, openSync, closeSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { randomBytes } from 'node:crypto'
 
 export const GUARD_DIR = join(homedir(), '.vaibot', 'guard')
 export const LOCK_FILE = join(GUARD_DIR, 'guard.json')
 export const LAUNCH_LOCK_FILE = join(GUARD_DIR, 'launch.lock')
+// Containment state lives HERE, machine-wide, rather than in a workspace log
+// dir — so every breaker on the machine reads one file, with no daemon, no
+// network and no credentials. That is the point: the paths where a breaker
+// degrades (daemon unreachable, no key, breaker tripped, fail-open) are exactly
+// the paths that must still observe it, and all of them can read a file.
+export const CONTAINMENT_FILE = join(GUARD_DIR, 'containment.json')
 export const DEFAULT_HOST = '127.0.0.1'
 export const DEFAULT_PORT = 39111
 export const PORT_SCAN_COUNT = 10
@@ -258,5 +264,44 @@ export async function ensureGuard(opts = {}, deps = {}) {
     return { ok: false, status: 'launch-failed', reason: 'no candidate port yielded a healthy guard' }
   } finally {
     if (acquired) await d.releaseLock()
+  }
+}
+
+/**
+ * Read machine-wide containment state. Absent or unreadable => not engaged, so
+ * a machine that has never been contained behaves normally.
+ *
+ * @returns {{contained: boolean, at: string|null, reason: string|null}}
+ */
+export function readContainment(file = CONTAINMENT_FILE) {
+  try {
+    const raw = JSON.parse(readFileSync(file, 'utf-8'))
+    return {
+      contained: raw?.contained === true,
+      at: typeof raw?.at === 'string' ? raw.at : null,
+      reason: typeof raw?.reason === 'string' ? raw.reason : null,
+    }
+  } catch {
+    return { contained: false, at: null, reason: null }
+  }
+}
+
+/**
+ * Record containment state for every breaker on this machine. Atomic, 0600.
+ * Best-effort: the in-process flag is what gates the daemon's own decisions,
+ * and a breaker that cannot read the file falls back to asking the daemon.
+ */
+export function writeContainment(contained, reason = null, file = CONTAINMENT_FILE) {
+  try {
+    // The directory of the file we were GIVEN — not the default one. They
+    // coincide in production and diverge in tests, which is how this was found.
+    mkdirSync(dirname(file), { recursive: true })
+    const tmp = file + '.tmp'
+    writeFileSync(tmp, JSON.stringify({ contained: !!contained, reason: reason ?? null, at: new Date().toISOString() }), { mode: 0o600 })
+    renameSync(tmp, file)
+    try { chmodSync(file, 0o600) } catch { /* best effort */ }
+    return true
+  } catch {
+    return false
   }
 }

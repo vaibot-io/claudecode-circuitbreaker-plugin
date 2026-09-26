@@ -88,6 +88,55 @@ function defaultTables() {
   }
 }
 
+// ── Host tool vocabulary (always recognised) ────────────────────────────────
+//
+// Agent hosts name the same primitives differently. A host tool the classifier
+// doesn't recognise lands on `unknown` → ask, which quietly hollows out the
+// floor: a destructive shell command arriving under Hermes' `terminal` would be
+// asked about instead of denied, and a plain `ls` would be asked about too.
+// Mapping each host's names onto a table kind here keeps ONE vocabulary for
+// every breaker instead of one per plugin.
+//
+// Consulted only AFTER the active tables, so an explicit table entry (built-in
+// or signed) still wins. It lives outside defaultTables() on purpose: a signed
+// bundle's classifierTables REPLACE the built-ins wholesale, and a bundle that
+// predates a host must not silently erase that host's names.
+const HOST_TOOL_KINDS = Object.freeze({
+  // Hermes Agent — names as registered under hermes-agent/tools/.
+  terminal: 'exec', //       { command, workdir, background, … }
+  write_file: 'write', //    { path, content }
+  patch: 'write', //         { mode, path, old_string, new_string } | { mode: 'patch', patch }
+  read_file: 'read', //      { path, offset, limit }
+  search_files: 'read', //   { pattern, target, path, … }
+  web_extract: 'network', // { urls, … }
+  // Deliberately absent: execute_code runs Python, not a shell command. Routing
+  // it through classifyBash would read `cat = open(...)` as the safe `cat`
+  // command and allow it, so it stays unknown → ask.
+})
+
+/**
+ * The table kind a tool name resolves to — 'exec' | 'read' | 'write' | 'search'
+ * | 'network' — or null when unrecognised. Resolution order is the one
+ * classify() uses: the active tables first, then the built-in host vocabulary.
+ *
+ * @param {string} tool
+ * @param {object} [tables] — defaults to the built-in tables
+ * @returns {'exec'|'read'|'write'|'search'|'network'|null}
+ */
+export function toolKind(tool, tables) {
+  const t = norm(tool)
+  const tb = tables ?? defaultTables()
+  const listed = (list) => Array.isArray(list) && list.includes(t)
+  if (listed(tb.execTools)) return 'exec'
+  if (listed(tb.readTools)) return 'read'
+  if (listed(tb.writeTools)) return 'write'
+  if (listed(tb.searchTools)) return 'search'
+  if (listed(tb.networkTools)) return 'network'
+  // Own-property check: a plain lookup would resolve `constructor` or
+  // `toString` to a prototype member and hand back a non-kind.
+  return Object.hasOwn(HOST_TOOL_KINDS, t) ? HOST_TOOL_KINDS[t] : null
+}
+
 // High-confidence destructive patterns → DENY. Kept conservative on purpose:
 // the signed bundle carries the authoritative richer set. Anchored / bounded
 // to avoid catastrophic backtracking.
@@ -242,10 +291,74 @@ function matchesLiveGuardPort(text, port) {
  * @param {number} [guardPort] live guard port to protect (port-as-data); the default branch covers the static default
  * @returns {{category:string, risk:string, boundary:string, reversible:boolean, reasons:string[]}}
  */
+// ── Data payloads are not commands (F4) ──────────────────────────────────────
+//
+// The floor matches patterns against the raw command string, which cannot tell
+// an instruction from its data. So a heredoc body being written to a file, or a
+// pattern being searched FOR, was matched as though it were being run: writing
+// documentation about the guard, or grepping for the rule that fires, both got
+// denied. Data is excluded from matching before the patterns run.
+//
+// This is NOT a weakening. The same bytes were already unmatched when written
+// through a file-write tool, which never inspected content at all — this makes
+// the two paths agree rather than opening anything new. Content that will
+// actually be EXECUTED is deliberately still matched, which is why a heredoc
+// feeding an interpreter keeps its body.
+const CODE_RECEIVER = /\b(?:sh|bash|zsh|dash|ksh|python3?|node|perl|ruby|php|pwsh|powershell|osascript|env)\b/i
+
+/** Drop heredoc bodies that are data. A body fed to an interpreter is kept. */
+function stripHeredocBodies(command) {
+  const lines = command.split('\n')
+  const out = []
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    out.push(line)
+    const m = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_-]*)\1/.exec(line)
+    if (!m) { i++; continue }
+    // Is the thing receiving this heredoc going to run it?
+    const executed = CODE_RECEIVER.test(line.slice(0, m.index))
+    const delim = m[2]
+    i++
+    const body = []
+    while (i < lines.length && lines[i].trim() !== delim) { body.push(lines[i]); i++ }
+    if (executed) out.push(...body) // e.g. `python3 - <<PY` — this is code
+    if (i < lines.length) out.push(lines[i]) // keep the terminator
+    i++
+  }
+  return out.join('\n')
+}
+
+/** A search pattern is what you are looking for, not what you are doing. */
+function stripSearchPatterns(command) {
+  return command.replace(
+    /\b(grep|egrep|fgrep|rg|ag|ack)\b((?:\s+-{1,2}[\w-]+)*)\s+('[^']*'|"[^"]*")/gi,
+    (_m, cmd, flags) => `${cmd}${flags} ''`,
+  )
+}
+
+/** A request body is data in flight. The URL and any pipe stay visible. */
+function stripRequestBodies(command) {
+  return command.replace(
+    /(\s(?:-d|--data|--data-raw|--data-binary|--data-urlencode|--json)\s+)('[^']*'|"[^"]*")/gi,
+    (_m, flag) => `${flag}''`,
+  )
+}
+
+/**
+ * What the floor should actually inspect: the command, with its data removed.
+ * Exported so the behaviour is testable and so a host can reason about it.
+ */
+export function commandForMatching(command) {
+  return stripRequestBodies(stripSearchPatterns(stripHeredocBodies(String(command ?? ''))))
+}
+
 export function classifyBash(command, tables = defaultTables(), guardPort) {
   const reasons = []
-  const full = String(command ?? '')
-  if (!full.trim()) {
+  const raw = String(command ?? '')
+  // Match against the command with its data payloads removed (see above).
+  const full = commandForMatching(raw)
+  if (!raw.trim()) {
     return { category: CATEGORY.EXEC, risk: RISK.MEDIUM, boundary: BOUNDARY.NONE, reversible: true, reasons: ['empty command'] }
   }
 
@@ -405,37 +518,33 @@ export function classify(call, cfg = {}) {
     return finalize(rawTool, CATEGORY.READ, RISK.SAFE, BOUNDARY.NONE, true, ['vaibot self/governance call'])
   }
 
-  const execTools = new Set(tables.execTools)
-  const readTools = new Set(tables.readTools)
-  const writeTools = new Set(tables.writeTools)
-  const networkTools = new Set(tables.networkTools)
-  const searchTools = new Set(tables.searchTools)
+  const kind = toolKind(tool, tables)
 
-  if (execTools.has(tool)) {
+  if (kind === 'exec') {
     const command = typeof input === 'string' ? input : input?.command ?? input?.cmd ?? ''
     const b = classifyBash(command, tables, cfg.guardPort)
     return finalize(rawTool, b.category, b.risk, b.boundary, b.reversible, b.reasons, escalateAt)
   }
 
-  if (readTools.has(tool)) {
+  if (kind === 'read') {
     category = CATEGORY.READ
     boundary = BOUNDARY.INGRESS
     reversible = true
     risk = RISK.SAFE
     reasons.push(`read tool: ${tool}`)
-  } else if (writeTools.has(tool)) {
+  } else if (kind === 'write') {
     category = CATEGORY.WRITE
     boundary = BOUNDARY.EGRESS
     reversible = false
     risk = RISK.LOW
     reasons.push(`write tool: ${tool}`)
-  } else if (searchTools.has(tool)) {
+  } else if (kind === 'search') {
     category = CATEGORY.NETWORK
     boundary = BOUNDARY.INGRESS
     reversible = true
     risk = RISK.LOW
     reasons.push(`search tool: ${tool}`)
-  } else if (networkTools.has(tool)) {
+  } else if (kind === 'network') {
     category = CATEGORY.NETWORK
     boundary = BOUNDARY.BOTH
     reversible = false

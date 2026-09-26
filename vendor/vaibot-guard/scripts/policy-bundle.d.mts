@@ -16,6 +16,15 @@ export interface PolicyBody {
   fileMutationOutsideWorkspaceAction?: 'deny' | 'approve'
   /** Optional overrides for the classifier rule tables. */
   classifierTables?: Record<string, unknown>
+  /** Per-preset ask threshold on the risk ladder (safe<low<medium<high<dangerous):
+   *  a classified risk >= this escalates to "ask"; DANGEROUS always denies. Absent ⇒
+   *  MEDIUM (prior behavior). balanced=high, strict=medium, permissive=dangerous. */
+  escalateAt?: 'safe' | 'low' | 'medium' | 'high' | 'dangerous'
+  /** When an agent host runs with its own approvals disabled (Hermes --yolo, Claude
+   *  Code --dangerously-skip-permissions, …) and the guard wants a human decision:
+   *  'deny' blocks it, 'approve' honours the bypass and records the override.
+   *  Absent ⇒ 'deny'. Never affects the catastrophic floor. */
+  hostBypassAction?: 'deny' | 'approve'
 }
 
 export interface PolicyBundle {
@@ -46,6 +55,9 @@ export interface EffectivePolicy {
   denyPaths: string[]
   fileMutationOutsideWorkspaceAction?: 'deny' | 'approve'
   classifierTables?: Record<string, unknown>
+  escalateAt?: string
+  /** Always resolved: 'deny' unless a verified bundle says 'approve'. */
+  hostBypassAction: 'deny' | 'approve'
 }
 
 export function canonicalPayload(bundle: Partial<PolicyBundle>): string
