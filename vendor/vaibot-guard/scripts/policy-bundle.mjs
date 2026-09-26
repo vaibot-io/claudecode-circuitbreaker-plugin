@@ -136,6 +136,13 @@ export function loadPolicyBundle(args = {}) {
  * classifier uses its own conservative default tables) — never relaxing
  * enforcement. denyTokens are word-boundary command-family denials (the guard
  * unions them onto its local denyTokens — additive, tighten-only).
+ *
+ * hostBypassAction governs what happens when an agent host is running with its
+ * own approvals switched off (Hermes --yolo, Claude Code
+ * --dangerously-skip-permissions, …) and the guard wants a human decision:
+ * 'deny' blocks the action, 'approve' honours the bypass and records that it
+ * did. Absent — including on any bundle failure — means 'deny'. It never
+ * reaches the catastrophic floor, which denies before any approval exists.
  */
 export function effectivePolicy(loadResult) {
   if (loadResult && loadResult.ok && loadResult.policy) {
@@ -152,6 +159,7 @@ export function effectivePolicy(loadResult) {
           : undefined,
       classifierTables: p.classifierTables ?? undefined,
       escalateAt: typeof p.escalateAt === 'string' ? p.escalateAt : undefined,
+      hostBypassAction: p.hostBypassAction === 'approve' ? 'approve' : 'deny',
     }
   }
   return {
@@ -162,5 +170,6 @@ export function effectivePolicy(loadResult) {
     denyPaths: [],
     fileMutationOutsideWorkspaceAction: undefined,
     classifierTables: undefined,
+    hostBypassAction: 'deny',
   }
 }

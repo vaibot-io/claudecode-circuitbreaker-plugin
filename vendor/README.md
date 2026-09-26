@@ -2,7 +2,7 @@
 
 ## `vaibot-guard/` — a committed, real-file copy of `@vaibot/guard`
 
-**Current version: `1.0.2`** (keep in lockstep with the version the `vaibot` CLI
+**Current version: `2.2.0`** (keep in lockstep with the version the `vaibot` CLI
 installs globally and with the codex/openclaw plugin vendors).
 
 ### Why this is vendored
@@ -31,4 +31,5 @@ find vendor/vaibot-guard -type l    # must print nothing
 node --test test/*.test.mjs
 ```
 
-Then update the version above and `devDependencies["@vaibot/guard"]` in `package.json`.
+Then update the version above. `devDependencies["@vaibot/guard"]` is a `workspace:*`
+link and needs no change.

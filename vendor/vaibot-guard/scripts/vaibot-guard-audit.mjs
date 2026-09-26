@@ -22,11 +22,17 @@ function die(msg, code = 2) {
   process.exit(code);
 }
 
+// Must stay identical to the service's copy: checkpoint hashes are recomputed
+// here from what the service wrote.
 function stableStringify(value) {
   if (value === null || value === undefined) return JSON.stringify(value);
   if (typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return "[" + value.map((v) => stableStringify(v)).join(",") + "]";
-  const keys = Object.keys(value).sort();
+  if (Array.isArray(value)) {
+    return "[" + value.map((v) => (v === undefined || typeof v === "function" ? "null" : stableStringify(v))).join(",") + "]";
+  }
+  const keys = Object.keys(value)
+    .filter((k) => value[k] !== undefined && typeof value[k] !== "function")
+    .sort();
   return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableStringify(value[k])).join(",") + "}";
 }
 

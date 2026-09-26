@@ -16,7 +16,9 @@ WorkingDirectory=%h/.local/share/vaibot-guard
 
 EnvironmentFile=%h/.config/vaibot-guard/vaibot-guard.env
 
-ExecStart=/usr/bin/env node scripts/vaibot-guard-service.mjs
+# Absolute path, written by `vaibot-guard install-local`. A relative path
+# resolved against WorkingDirectory would run whatever code later sat there.
+ExecStart=/usr/bin/env node %h/.local/share/vaibot-guard/scripts/vaibot-guard-service.mjs
 Restart=on-failure
 RestartSec=2
 

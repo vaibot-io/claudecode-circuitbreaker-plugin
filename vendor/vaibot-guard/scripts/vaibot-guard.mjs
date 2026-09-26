@@ -167,15 +167,27 @@ function parseJsonFlag(name, value) {
 
 const [command, ...rest] = process.argv.slice(2);
 if (!command || command === "-h" || command === "--help") {
-  console.log(`vaibot-guard (MVP)\n\nCommands:\n  install-local\n  configure [--env_file <path>]\n  precheck --intent '<json>'\n  exec --intent '<json>' -- <command...>\n  finalize --run_id <id> --result '<json>'\n  flush [--session_id <id>]\n  proof --session_id <id> --index <n> --checkpoint_seq <n>\n\nNotes:\n  - CLI reads VAIBOT_GUARD_TOKEN/PORT from env or from ${ENV_FILE}\n`);
+  console.log(`vaibot-guard (MVP)\n\nCommands:\n  install-local\n  configure [--env_file <path>]\n  classify [--intent '<json>'] [--escalate-at <risk>]   (or intent on stdin)\n  bootstrap --agent <name> [--timeout-ms <n>]\n  precheck --intent '<json>'\n  exec --intent '<json>' -- <command...>\n  finalize --run_id <id> --result '<json>'\n  flush [--session_id <id>]\n  proof --session_id <id> --index <n> --checkpoint_seq <n>\n\nNotes:\n  - CLI reads VAIBOT_GUARD_TOKEN/PORT from env or from ${ENV_FILE}\n`);
   process.exit(0);
 }
 
 const flags = parseArgs(rest);
 const sessionId = process.env.VAIBOT_SESSION_ID || process.env.OPENCLAW_SESSION_KEY || process.env.OPENCLAW_SESSION || "unknown-session";
 
+/** Read all of stdin as a string. Returns "" when stdin is a TTY (nothing piped). */
+async function readStdin() {
+  if (process.stdin.isTTY) return "";
+  let raw = "";
+  for await (const chunk of process.stdin) raw += chunk;
+  return raw;
+}
+
 async function maybeOnboard() {
-  if (command === "configure") return;
+  // `classify` is a pure, offline query used on degraded paths where the daemon
+  // may be down — it must never prompt, write an env file, or restart a unit.
+  // `bootstrap` is called by a breaker from inside an agent: same constraint,
+  // and its only write is the credential store it exists to populate.
+  if (command === "configure" || command === "classify" || command === "bootstrap") return;
 
   // Only prompt in interactive terminals.
   if (!process.stdin.isTTY) return;
@@ -357,11 +369,50 @@ async function cmdInstallLocal() {
     const SKILL_DIR = path.resolve(SCRIPT_DIR, "..");
     const envSrc = path.join(SKILL_DIR, "references", "systemd", "vaibot-guard.env");
 
+    // The unit must name the code it runs by ABSOLUTE path.
+    //
+    // ExecStart used to be `node scripts/vaibot-guard-service.mjs`, resolved
+    // against WorkingDirectory — so the unit recorded whichever directory
+    // install-local happened to run from, and then executed whatever code later
+    // sat there. On one machine that produced three candidate runtimes (an
+    // OpenClaw skill copy, a monorepo checkout, and the npm install) with the
+    // unit naming a directory that was not the one actually serving. An
+    // absolute entry point makes the unit name a specific file.
+    const SERVICE_ENTRY = path.join(SKILL_DIR, "scripts", "vaibot-guard-service.mjs");
+    if (!fs.existsSync(SERVICE_ENTRY)) {
+      die(`cannot find the service entry point at ${SERVICE_ENTRY}`);
+    }
+
+    // A source checkout is not a runtime. Installing from one means `git
+    // checkout` silently changes what the service will run on its next start,
+    // and the version it reports tracks whichever branch is out — which makes
+    // guard_version telemetry fiction. Refuse by default, with an explicit
+    // escape for anyone who knows they want it.
+    const inSourceTree = (() => {
+      let dir = SKILL_DIR;
+      for (let i = 0; i < 6; i++) {
+        if (fs.existsSync(path.join(dir, ".git"))) return dir;
+        const up = path.dirname(dir);
+        if (up === dir) break;
+        dir = up;
+      }
+      return null;
+    })();
+    if (inSourceTree && !process.argv.includes("--allow-source-tree")) {
+      die(
+        `refusing to install a service that runs from a source checkout (${inSourceTree}).\n` +
+          `  A checkout is not a runtime: switching branches changes what the service runs,\n` +
+          `  and the version it reports follows whatever is checked out.\n` +
+          `  Install the published package first:  npm install -g @vaibot/guard\n` +
+          `  then re-run install-local from there. To override anyway: --allow-source-tree`,
+      );
+    }
+
     // Option A: generate the systemd unit entirely in code, so we don't depend
     // on shipping any `*.service` files. The openclaw-gateway ordering deps are
     // added only on OpenClaw hosts (detected by the `openclaw` binary on PATH);
-    // the guard runs standalone for any other agent. WorkingDirectory is the
-    // actual install location, so it works for an npm install or clawhub alike.
+    // the guard runs standalone for any other agent. WorkingDirectory stays for
+    // relative policy/log paths, but no longer decides which code runs.
     const isOpenClawHost = (process.env.PATH || "")
       .split(path.delimiter)
       .some((dir) => {
@@ -374,7 +425,7 @@ async function cmdInstallLocal() {
     const unitDeps = isOpenClawHost
       ? "After=network-online.target openclaw-gateway.service\nWants=openclaw-gateway.service\nPartOf=openclaw-gateway.service\n"
       : "After=network-online.target\n";
-    const unitTemplate = `[Unit]\nDescription=VAIBot Guard policy service (user)\n${unitDeps}\n[Service]\nType=simple\nWorkingDirectory=${SKILL_DIR}\nEnvironmentFile=%h/.config/vaibot-guard/vaibot-guard.env\nExecStart=/usr/bin/env node scripts/vaibot-guard-service.mjs\nRestart=on-failure\nRestartSec=2\n\n# Hardening (user-scope, safe defaults)\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=default.target\n`;
+    const unitTemplate = `[Unit]\nDescription=VAIBot Guard policy service (user)\n${unitDeps}\n[Service]\nType=simple\nWorkingDirectory=${SKILL_DIR}\nEnvironmentFile=%h/.config/vaibot-guard/vaibot-guard.env\nExecStart=/usr/bin/env node ${SERVICE_ENTRY}\nRestart=on-failure\nRestartSec=2\n\n# Hardening (user-scope, safe defaults)\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=default.target\n`;
 
     const envTemplate = `# VAIBot Guard (user service) environment\n\n# Required for service auth (recommended)\n# VAIBOT_GUARD_TOKEN=\n\n# Policy file\n# VAIBOT_POLICY_PATH=references/policy.default.json\n\n# Service bind\n# VAIBOT_GUARD_HOST=127.0.0.1\n# VAIBOT_GUARD_PORT=39111\n\n# Workspace + logs\n# VAIBOT_WORKSPACE=\n# VAIBOT_GUARD_LOG_DIR=\n\n# VAIBot anchoring\n# VAIBOT_API_URL=https://provenance.vaibot.io/api\n# VAIBOT_API_KEY=\n# VAIBOT_PROVE_MODEL=vaibot-guard\n# VAIBOT_PROVE_MODE=best-effort\n\n# Checkpoint cadence\n# VAIBOT_MERKLE_CHECKPOINT_EVERY=50\n# VAIBOT_MERKLE_CHECKPOINT_EVERY_MS=600000\n`;
     const unitDstDir = path.join(os.homedir(), ".config", "systemd", "user");
@@ -521,7 +572,146 @@ if (command === "configure") {
 
 await maybeOnboard();
 
-if (command === "precheck") {
+if (command === "bootstrap") {
+  // One-shot account provisioning for a breaker that has no API key.
+  //
+  // WHY here: ~/.vaibot/credentials.json is shared by every breaker on the
+  // machine, and creds.mjs is its single writer — merge-on-write per env, legacy
+  // format migration, atomic rename. A non-Node host (the Hermes Python plugin)
+  // calls this rather than growing a second writer in a second language.
+  //
+  //   vaibot-guard bootstrap --agent hermes
+  //
+  // stdout (exit 0) is one JSON line. It never carries the key: the caller
+  // re-reads it from the store, so the secret doesn't cross a process boundary.
+  //   {"ok":true,"env":"…","provisioned":true,"wallet_address":"0x…","wallet_network":"…"}
+  //   {"ok":true,"env":"…","provisioned":false,"reason":"key-present"}     no network call made
+  //   {"ok":true,"env":"…","provisioned":false,"reason":"account-exists"}  this machine has an
+  //       account but the local key is gone — recover with `vaibot login`
+  // Any non-zero exit prints nothing on stdout: the caller could not get an
+  // answer and must fall back to its own keyless posture.
+  const { migrateFileIfNeeded, resolveCredentials, saveCredsForEnv, keyPrefixMatchesEnv } = await import("./lib/creds.mjs");
+
+  const agent = typeof flags.agent === "string" ? flags.agent.trim() : "";
+  if (!/^[a-z][a-z0-9_-]{0,63}$/.test(agent)) die("bootstrap: --agent <name> is required (e.g. --agent hermes)");
+  const timeoutMs = Number(flags["timeout-ms"]) > 0 ? Number(flags["timeout-ms"]) : 10000;
+
+  migrateFileIfNeeded();
+  // resolveCredentials applies the §5 gate: a production URL override is
+  // ignored unless VAIBOT_ALLOW_URL_OVERRIDE is set, so an injected env var
+  // can't redirect provisioning to a host of its choosing.
+  const resolved = resolveCredentials();
+  const answer = (fields) => {
+    process.stdout.write(JSON.stringify({ ok: true, env: resolved.env, ...fields }) + "\n");
+    process.exit(0);
+  };
+
+  if (resolved.apiKey) answer({ provisioned: false, reason: "key-present" });
+
+  // The fingerprint every breaker sends: one account per user@host, whichever
+  // breaker gets there first, so a machine never forks into several identities.
+  const fingerprint = createHash("sha256").update(`${os.userInfo().username}@${os.hostname()}`).digest("hex");
+
+  let res;
+  try {
+    res = await fetch(`${resolved.apiBaseUrl}/v2/bootstrap`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ fingerprint, agent }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (e) {
+    die(`bootstrap: ${resolved.apiBaseUrl} unreachable — ${e?.message || e}`);
+  }
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    die(`bootstrap: server returned ${res.status} ${text.slice(0, 200)}`);
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    die("bootstrap: server returned invalid JSON");
+  }
+
+  if (typeof data?.api_key === "string" && data.api_key) {
+    // A key for the wrong env would be stored, then ignored by every reader
+    // (keyMismatch), and bootstrap would run again on every call. Refuse it.
+    if (!keyPrefixMatchesEnv(data.api_key, resolved.env)) {
+      die(`bootstrap: server issued a key for a different environment than ${resolved.env} — not saved`);
+    }
+    saveCredsForEnv(resolved.env, { api_key: data.api_key, wallet_address: data.wallet_address });
+    answer({
+      provisioned: true,
+      wallet_address: typeof data.wallet_address === "string" ? data.wallet_address : null,
+      wallet_network: typeof data.wallet_network === "string" ? data.wallet_network : null,
+    });
+  }
+  if (data?.bootstrapped === false) answer({ provisioned: false, reason: "account-exists" });
+  die("bootstrap: server answered with neither a key nor an existing account");
+}
+
+if (command === "classify") {
+  // One-shot, offline risk classification.
+  //
+  // WHY: every circuit-breaker plugin falls back to the local classifier when the
+  // daemon is unreachable — that fallback IS the safety floor. The classifier is
+  // Node, so a non-Node host (the Hermes Python plugin) could only reach it by
+  // reimplementing it, which would mean two implementations of the floor drifting
+  // apart. This exposes the real one instead. No daemon, no network, no writes —
+  // "daemon down" does not imply "node missing", so this still answers.
+  //
+  //   echo '{"toolName":"Bash","params":{"command":"rm -rf /"}}' | vaibot-guard classify
+  //   vaibot-guard classify --intent '{"tool":"Write","input":{"file_path":"/etc/hosts"}}'
+  //
+  // stdout: the classifier verdict. Callers read `verdictHint` (allow|ask|deny).
+  // Exit 0 = classified. Exit 2 = could not classify — callers MUST treat that as
+  // a failure to answer and fall back to their own fail-closed posture, never as
+  // an allow.
+  const { classify } = await import("./classifier.mjs");
+
+  const raw = flags.intent ? String(flags.intent) : await readStdin();
+  if (!String(raw).trim()) {
+    die("classify: provide an intent on stdin or via --intent '<json>'");
+  }
+
+  let intent;
+  try {
+    intent = JSON.parse(raw);
+  } catch (e) {
+    die(`classify: invalid JSON intent — ${e?.message || e}`);
+  }
+  if (!intent || typeof intent !== "object") die("classify: intent must be a JSON object");
+
+  // Accept both shapes: the classifier's native {tool,input} and the wire shape
+  // {toolName,params} that /v1/decide/tool already speaks, so a caller holding a
+  // decide payload can pass it straight through without reshaping.
+  const tool = intent.tool ?? intent.toolName;
+  const input = intent.input ?? intent.params;
+  if (typeof tool !== "string" || !tool.trim()) {
+    die("classify: intent requires a non-empty `tool` (or `toolName`)");
+  }
+
+  // escalateAt lets a caller reproduce a preset's ask threshold; omitted means the
+  // classifier's own default. guardPort feeds the guard self-protection patterns.
+  const escalateAt = flags["escalate-at"] ?? flags.escalateAt ?? intent.escalateAt;
+
+  let verdict;
+  try {
+    verdict = classify(
+      { tool, input },
+      { ...(escalateAt ? { escalateAt: String(escalateAt) } : {}), guardPort: GUARD_PORT },
+    );
+  } catch (e) {
+    // Never emit a partial or guessed verdict — an unusable answer must look like
+    // a failure so the caller falls back to fail-closed instead of reading a
+    // missing verdictHint as "allow".
+    die(`classify: classifier error — ${e?.message || e}`, 2);
+  }
+
+  process.stdout.write(JSON.stringify(verdict) + "\n");
+  process.exit(0);
+} else if (command === "precheck") {
   const intent = parseJsonFlag("intent", flags.intent);
 
   // For now, we decide based on the actual command you intend to run.
