@@ -3,6 +3,8 @@
 
 export const GUARD_DIR: string
 export const LOCK_FILE: string
+export const LAUNCH_LOCK_FILE: string
+export const CONTAINMENT_FILE: string
 export const DEFAULT_HOST: '127.0.0.1'
 export const DEFAULT_PORT: 39111
 export const PORT_SCAN_COUNT: 10
@@ -50,10 +52,39 @@ export type EnsureGuardResult =
   | (GuardLock & { ok: true; status: 'reused' | 'launched' })
   | { ok: false; status: 'no-launcher' | 'launch-failed'; reason: string }
 
+/** Machine-wide containment state, as the guard writes it. */
+export interface Containment {
+  /** True only for a literal `true` in the record; anything else is not engaged. */
+  contained: boolean
+  /** ISO-8601, when it was engaged. */
+  at: string | null
+  /** Why it was engaged, when the control plane sent a reason. */
+  reason: string | null
+}
+
 export function defaultCandidatePorts(base?: number, count?: number): number[]
 export function readLock(path?: string): GuardLock | null
 export function writeLock(lock: GuardLock, path?: string, dir?: string): GuardLock
 export function genToken(): string
+
+/**
+ * Read machine-wide containment. Absent or unreadable means NOT engaged, so this
+ * never raises and never fails into containment.
+ */
+export function readContainment(file?: string): Containment
+/** Record containment for every breaker on the machine. Atomic, 0600, best-effort. */
+export function writeContainment(contained: boolean, reason?: string | null, file?: string): boolean
+
+/** Cross-process single-flight mutex via an O_EXCL lock file. True iff WE hold it. */
+export function acquireFileLock(
+  path?: string,
+  opts?: { staleMs?: number; now?: () => number },
+): boolean
+export function releaseFileLock(path?: string): void
+/** Blocking acquire; false means we gave up waiting and the caller proceeds best-effort. */
+export function defaultAcquireLock(
+  opts?: { timeoutMs?: number; pollMs?: number; now?: () => number },
+): Promise<boolean>
 export function isCompatible(running: string | null | undefined, required: string | null | undefined): boolean
 export function httpHealth(
   host: string,
