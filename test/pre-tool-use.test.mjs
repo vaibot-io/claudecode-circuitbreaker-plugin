@@ -66,7 +66,7 @@ function seedCredsUrl(homeDir, { env = 'staging', url, apiKey } = {}) {
   writeFileSync(file, JSON.stringify(store))
 }
 
-function runHook({ apiUrl, mode = 'enforce', input }) {
+function runHook({ apiUrl, mode = 'enforce', input, containment = null, extraEnv = {} }) {
   // Per-call fake HOME isolates the new breaker-state file at
   // ~/.vaibot/breaker-state/claudecode.json from the user's real home and
   // from other test runs. STATE_DIR (/tmp/vaibot-claudecode/) is intentionally
@@ -74,6 +74,15 @@ function runHook({ apiUrl, mode = 'enforce', input }) {
   // new breaker.test.mjs sandboxes it via TMPDIR for its own scenarios.
   const fakeHome = mkdtempSync(join(tmpdir(), 'vaibot-claudecode-test-home-'))
   seedCredsUrl(fakeHome, { url: apiUrl, apiKey: 'test-key' }) // account base + key from the file (single store), no env override
+  // Containment is machine-wide, in the shared rendezvous dir the guard owns —
+  // seeded here so the hook reads it the way a real breaker does, with no daemon.
+  if (containment) {
+    const guardDir = join(fakeHome, '.vaibot', 'guard')
+    mkdirSync(guardDir, { recursive: true })
+    // A string is written verbatim so a test can seed a corrupt record; an object
+    // is serialised the way the guard writes it.
+    writeFileSync(join(guardDir, 'containment.json'), typeof containment === 'string' ? containment : JSON.stringify(containment))
+  }
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [SCRIPT], {
       env: {
@@ -85,6 +94,7 @@ function runHook({ apiUrl, mode = 'enforce', input }) {
         VAIBOT_API_KEY: 'test-key',
         VAIBOT_MODE: mode,
         VAIBOT_TIMEOUT_MS: '2000',
+        ...extraEnv,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     })
@@ -739,5 +749,101 @@ test('STATE_DIR perms are tightened on the fly when a legacy 0o755 dir already e
   } finally {
     await server.close()
     try { rmSync(STATE_DIR, { recursive: true, force: true }) } catch {}
+  }
+})
+
+// ── Containment ───────────────────────────────────────────────────────────────
+// Containment is the account-wide stop. The guard enforces it for any call that
+// reaches the daemon; these tests pin the half the breaker owns — the paths where
+// the daemon is never consulted at all, which are exactly the paths a stop has to
+// survive. The record is read with no daemon, no network and no credentials, so
+// every assertion below also proves the mock server was never called.
+
+const CONTAINED = { contained: true, reason: 'laptop looks compromised', at: new Date().toISOString() }
+
+function denial(stdout) {
+  return JSON.parse(stdout).hookSpecificOutput
+}
+
+test('contained: a benign tool call is denied, and the guard is never consulted', async () => {
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    const r = await runHook({
+      apiUrl: server.url,
+      containment: CONTAINED,
+      input: { tool_name: 'Read', tool_input: { file_path: '/tmp/notes.txt' }, session_id: 'sess_c1', tool_use_id: 'tu_c1' },
+    })
+    const out = denial(r.stdout)
+    assert.equal(out.permissionDecision, 'deny')
+    assert.match(out.permissionDecisionReason, /containment engaged/i)
+    assert.match(out.permissionDecisionReason, /laptop looks compromised/, 'the reason given when engaging should reach the agent')
+    assert.equal(server.requests.length, 0, 'containment must not need the daemon or the control plane')
+  } finally {
+    await server.close()
+  }
+})
+
+test('contained: observe mode does NOT lift it — nothing else survives observe', async () => {
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    const r = await runHook({
+      apiUrl: server.url,
+      mode: 'observe',
+      containment: CONTAINED,
+      input: { tool_name: 'Read', tool_input: { file_path: '/tmp/notes.txt' }, session_id: 'sess_c2', tool_use_id: 'tu_c2' },
+    })
+    assert.equal(denial(r.stdout).permissionDecision, 'deny')
+    assert.equal(server.requests.length, 0)
+  } finally {
+    await server.close()
+  }
+})
+
+test('contained: VAIBOT_FAIL_OPEN does NOT lift it — the fail-open path is the point', async () => {
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    const r = await runHook({
+      apiUrl: server.url,
+      containment: CONTAINED,
+      extraEnv: { VAIBOT_FAIL_OPEN: 'true' },
+      input: { tool_name: 'Bash', tool_input: { command: 'echo hi' }, session_id: 'sess_c3', tool_use_id: 'tu_c3' },
+    })
+    assert.equal(denial(r.stdout).permissionDecision, 'deny')
+    assert.equal(server.requests.length, 0)
+  } finally {
+    await server.close()
+  }
+})
+
+test('contained: the governance tools stay usable, so an operator can lift it', async () => {
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    const r = await runHook({
+      apiUrl: server.url,
+      containment: CONTAINED,
+      input: { tool_name: 'mcp__vaibot__vaibot_status', tool_input: {}, session_id: 'sess_c4', tool_use_id: 'tu_c4' },
+    })
+    assert.equal(r.code, 0)
+    assert.equal(r.stdout.trim(), '', 'a governance self-call is not gated, contained or not')
+  } finally {
+    await server.close()
+  }
+})
+
+test('a corrupt containment record does not claim containment, and does not crash the hook', async () => {
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    // The breaker reads this on every single tool call; it must never be the
+    // thing that takes the hook down, and it must never fail to a stop.
+    const r = await runHook({
+      apiUrl: server.url,
+      containment: '{ not json',
+      input: { tool_name: 'Read', tool_input: { file_path: '/tmp/notes.txt' }, session_id: 'sess_c5', tool_use_id: 'tu_c5' },
+    })
+    const out = r.stdout ? JSON.parse(r.stdout).hookSpecificOutput : null
+    assert.notEqual(out?.permissionDecisionReason ?? '', undefined)
+    assert.ok(!/containment engaged/i.test(r.stdout), 'an unreadable record must not read as contained')
+  } finally {
+    await server.close()
   }
 })
