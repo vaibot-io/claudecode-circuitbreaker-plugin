@@ -2,7 +2,36 @@
 
 All notable changes to `@vaibot/claudecode-circuitbreaker-plugin`.
 
-## [1.3.2] — 2026-09-27 — the governance exemption is a namespace, not a prefix
+## [1.3.2] — 2026-09-28 — the governance exemption, and guard 2.3.0
+
+### Changed
+- **Vendored guard refreshed to 2.3.0**, taken from the published tarball and verified
+  against the digest the registry reports (`ecdd56a7f87604435e06a2eafc6de4b96bb7918b`),
+  so the committed copy is provably what npm serves. It brings:
+
+  - the **git classification fix** — `git -C <path> …` no longer launders
+    `reset --hard`, `clean -f` or `push --force` from ask to allow, and `branch -D` /
+    `tag -d` are no longer classified as reads;
+  - **`floorAsk`**, a verdict tier no preset can make silent;
+  - **approval leases** and **batch approvals**, which this breaker inherits through
+    the guard's decision path rather than implementing itself.
+
+  **This changes what runs without asking, on the `permissive` preset.** The guard
+  gained a third verdict tier — `floorAsk`, which always asks and which no preset can
+  lower — so actions that cannot be undone by whoever authorised them now prompt even
+  under `permissive`, which previously never prompted. Measured on the vendored
+  classifier this breaker uses in-process:
+
+  | command | 2.2.1 | 2.3.0 |
+  |---|---|---|
+  | `git branch -D <branch>` | allow | **ask** |
+  | `git -C <path> reset --hard` | allow | **ask** |
+  | `npm publish` · `cargo publish` | allow | **ask** |
+  | `git status` · `npm test` | allow | allow |
+
+  Routine work is untouched — there is a test table asserting exactly that, so the
+  tier cannot drift into "ask about everything". If the new prompts are unwelcome, the
+  lever is the preset, not the breaker version.
 
 ### Fixed
 - **A look-alike MCP server could take a tool namespace that was never governed.**
