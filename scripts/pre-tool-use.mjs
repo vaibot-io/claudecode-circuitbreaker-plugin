@@ -574,8 +574,16 @@ async function main() {
   const sessionId = hookInput.session_id ?? hookInput.sessionId ?? `cc-${Date.now()}`
   const toolUseId = hookInput.tool_use_id ?? hookInput.toolUseId ?? null
 
-  // Skip governance for the governance tools themselves (avoid recursion)
-  if (toolName.startsWith('mcp__vaibot')) {
+  // Governance tools are exempt so a governance call cannot recurse into governing
+  // itself, and so an operator can still lift containment from inside the agent.
+  //
+  // Matched at the namespace boundary, NOT as a bare prefix. Claude Code names MCP
+  // tools `mcp__<server>__<tool>`, so an exemption that any name merely BEGINNING
+  // with `mcp__vaibot` satisfied would hand a server called `vaibotage` a whole
+  // tool namespace that is never governed at all -- no containment, no floor,
+  // nothing. This check runs before the containment check below, so that gap was a
+  // way around the account-wide stop.
+  if (toolName === 'mcp__vaibot' || toolName.startsWith('mcp__vaibot__')) {
     process.exit(0)
   }
 

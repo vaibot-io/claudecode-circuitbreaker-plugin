@@ -830,6 +830,47 @@ test('contained: the governance tools stay usable, so an operator can lift it', 
   }
 })
 
+test('contained: a look-alike MCP server gets no exemption — the boundary is `mcp__vaibot__`', async () => {
+  // The exemption used to be a bare prefix, so every name BEGINNING with
+  // `mcp__vaibot` was ungoverned: a server called `vaibotage` got a whole tool
+  // namespace with no containment, no floor and no policy. The exemption is
+  // checked before containment, so this was a way around the account-wide stop.
+  for (const toolName of ['mcp__vaibotage__run', 'mcp__vaibotage', 'mcp__vaibot_evil__go', 'mcp__vaibotXYZ']) {
+    const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+    try {
+      const r = await runHook({
+        apiUrl: server.url,
+        containment: CONTAINED,
+        input: { tool_name: toolName, tool_input: {}, session_id: 'sess_sq', tool_use_id: `tu_${toolName}` },
+      })
+      const out = denial(r.stdout)
+      assert.equal(out.permissionDecision, 'deny', `${toolName} must not be exempt`)
+      assert.match(out.permissionDecisionReason, /containment engaged/i)
+    } finally {
+      await server.close()
+    }
+  }
+})
+
+test('the real governance namespace is still exempt, including the bare server name', async () => {
+  // The fix must not cost the operator the way out: these are the names that have
+  // to keep working while contained.
+  for (const toolName of ['mcp__vaibot', 'mcp__vaibot__vaibot_status', 'mcp__vaibot__vaibot_approve']) {
+    const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+    try {
+      const r = await runHook({
+        apiUrl: server.url,
+        containment: CONTAINED,
+        input: { tool_name: toolName, tool_input: {}, session_id: 'sess_gov', tool_use_id: `tu_${toolName}` },
+      })
+      assert.equal(r.code, 0, `${toolName} must stay usable`)
+      assert.equal(r.stdout.trim(), '', `${toolName} must not be gated`)
+    } finally {
+      await server.close()
+    }
+  }
+})
+
 test('a corrupt containment record does not claim containment, and does not crash the hook', async () => {
   const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
   try {
