@@ -60,6 +60,9 @@ export async function decideViaGuard(guard, request, opts = {}) {
     // but returning garbage — treat it as DENY, never silently allow.
     decision: typeof inner?.decision === 'string' ? inner.decision : 'deny',
     reason: inner?.reason ?? 'malformed guard decision',
+    // Agent-facing "what to do next", sent alongside reason. Undefined against a
+    // guard that predates it, so every consumer falls back to reason alone.
+    guidance: inner?.guidance,
     approvalId: inner?.approvalId ?? null,
     floor: inner?.floor === true, // un-overridable catastrophic floor (Tier-0)
     // Guard-published account mode (single source of truth). null when the guard

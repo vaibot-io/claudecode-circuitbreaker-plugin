@@ -718,8 +718,10 @@ async function main() {
       content_hash: result.approvalId ?? '',
       receipt_id: null,
       risk: result.risk && typeof result.risk === 'object' ? result.risk : { risk: result.risk ?? null },
-      decision: { decision: guardDecision, reason: result.reason },
-      shadow_decision: { decision: guardDecision, reason: result.reason },
+      // guidance rides along with reason: this adapter field-picks, so anything
+      // omitted here is silently dropped before the hook ever sees it.
+      decision: { decision: guardDecision, reason: result.reason, guidance: result.guidance },
+      shadow_decision: { decision: guardDecision, reason: result.reason, guidance: result.guidance },
       previously_approved: !!pending?.content_hash && result.decision === 'allow',
     }
 
@@ -741,6 +743,14 @@ async function main() {
     // observe-mode). Falls back to decision for older API responses.
     const rawDecision = data.shadow_decision?.decision ?? data.decision?.decision
     const rawReason = data.shadow_decision?.reason ?? data.decision?.reason
+    // `guidance` is the agent-facing "what to do next"; `reason` is the record
+    // of the decision. Guards older than the guidance change don't send it, so
+    // every use falls back to reason alone — nothing to gate on a version.
+    const rawGuidance = data.shadow_decision?.guidance ?? data.decision?.guidance
+
+    // Appended only to text the MODEL reads. Human-facing stderr lines stay on
+    // `reason`, which is what the receipt and the dashboard show.
+    const withGuidance = (text) => (rawGuidance ? `${text}\n${rawGuidance}` : text)
 
     // Save run state for post-tool-use finalization
     saveRunState(toolCallId, {
@@ -771,7 +781,9 @@ async function main() {
           hookSpecificOutput: {
             hookEventName: 'PreToolUse',
             permissionDecision: 'deny',
-            permissionDecisionReason: `VAIBot blocked (catastrophic floor, enforced even in observe) — ${rawReason}`,
+            permissionDecisionReason: withGuidance(
+              `VAIBot blocked (catastrophic floor, enforced even in observe) — ${rawReason}`
+            ),
           },
         }
         process.stdout.write(JSON.stringify(output))
@@ -814,10 +826,11 @@ async function main() {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
           permissionDecision: 'ask',
-          permissionDecisionReason:
+          permissionDecisionReason: withGuidance(
             `VAIBot flagged this ${toolName} call as ${riskLabel} risk — ${reason}\n` +
             `content_hash: ${contentHash}\n` +
-            `Approving here will record your decision in the VAIBot audit chain.`,
+            `Approving here will record your decision in the VAIBot audit chain.`
+          ),
         }
       }
       process.stdout.write(JSON.stringify(output))
@@ -832,7 +845,7 @@ async function main() {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
           permissionDecision: 'deny',
-          permissionDecisionReason: reason,
+          permissionDecisionReason: withGuidance(reason),
         }
       }
       process.stdout.write(JSON.stringify(output))

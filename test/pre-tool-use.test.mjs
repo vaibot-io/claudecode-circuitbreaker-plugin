@@ -158,7 +158,14 @@ function decideHandler(decisionBody) {
     ok: true,
     runId: decisionBody.run_id,
     risk: decisionBody.risk,
-    decision: { decision: inner.decision, reason: inner.reason, approvalId: decisionBody.content_hash },
+    decision: {
+      decision: inner.decision,
+      reason: inner.reason,
+      approvalId: decisionBody.content_hash,
+      // Only present when the fixture sets it, so the same helper exercises both
+      // a guidance-carrying guard and one predating it.
+      ...(inner.guidance ? { guidance: inner.guidance } : {}),
+    },
   }
   return (req) => (req.url === '/v1/decide/tool' ? { status: 200, body } : { status: 200, body: { ok: true } })
 }
@@ -182,6 +189,60 @@ test('approval_required → native ask (not deny)', async () => {
   } finally {
     await server.close()
     try { rmSync(stateFilePath('tu_ask1')) } catch {}
+  }
+})
+
+// The guard sends `guidance` — the agent-facing "what to do next" — separately
+// from `reason`, which is the record that lands in the receipt. The hook appends
+// it to the text the MODEL reads, and falls back to reason alone against a guard
+// that predates the field, so there is no version to gate on.
+test('guidance from the guard reaches the model', async () => {
+  const guidance = 'A human must approve this before it runs. Do not retry.'
+  const server = await startMockServer(decideHandler({
+    decision: { decision: 'approval_required', reason: 'High-risk', guidance },
+    shadow_decision: { decision: 'approval_required', reason: 'High-risk', guidance },
+    content_hash: 'sha256:g1', run_id: 'run_g1', risk: { risk: 'high' },
+  }))
+  try {
+    const res = await runHook({ apiUrl: server.url, input: {
+      tool_name: 'Bash', tool_input: { command: uniqCmd('curl g1') },
+      session_id: 's', tool_use_id: 'tu_guid1',
+    }})
+    const out = JSON.parse(res.stdout).hookSpecificOutput
+    assert.equal(out.permissionDecision, 'ask')
+    assert.ok(
+      out.permissionDecisionReason.includes(guidance),
+      'the model must see the guidance, not just the reason'
+    )
+    assert.match(out.permissionDecisionReason, /High-risk/, 'the reason is still there')
+  } finally {
+    await server.close()
+    try { rmSync(stateFilePath('tu_guid1')) } catch {}
+  }
+})
+
+test('a guard that sends no guidance still produces a clean message', async () => {
+  const server = await startMockServer(decideHandler({
+    decision: { decision: 'approval_required', reason: 'High-risk' },
+    shadow_decision: { decision: 'approval_required', reason: 'High-risk' },
+    content_hash: 'sha256:g2', run_id: 'run_g2', risk: { risk: 'high' },
+  }))
+  try {
+    const res = await runHook({ apiUrl: server.url, input: {
+      tool_name: 'Bash', tool_input: { command: uniqCmd('curl g2') },
+      session_id: 's', tool_use_id: 'tu_guid2',
+    }})
+    const out = JSON.parse(res.stdout).hookSpecificOutput
+    assert.equal(out.permissionDecision, 'ask')
+    assert.match(out.permissionDecisionReason, /High-risk/)
+    assert.doesNotMatch(
+      out.permissionDecisionReason,
+      /undefined|\n\s*$/,
+      'no dangling undefined or trailing blank line when guidance is absent'
+    )
+  } finally {
+    await server.close()
+    try { rmSync(stateFilePath('tu_guid2')) } catch {}
   }
 })
 
