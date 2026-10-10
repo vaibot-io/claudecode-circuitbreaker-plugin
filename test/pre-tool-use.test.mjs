@@ -297,38 +297,130 @@ test('finalize network error does not block deny output', async () => {
   } finally { await server.close() }
 })
 
-// Seed a stale ask-in-flight runState as if a prior PreToolUse emitted `ask`
-// and the user picked "No, tell Claude" (PostToolUse never fired to consume it).
-function seedStaleAsk(contentHash, toolUseId = 'tu_old') {
-  const stateDir = join(tmpdir(), 'vaibot-claudecode')
-  mkdirSync(stateDir, { recursive: true })
-  const path = join(stateDir, `${toolUseId}.json`)
-  writeFileSync(path, JSON.stringify({
-    tool_name: 'Bash', tool_use_id: toolUseId,
-    content_hash: contentHash, approval_required: true, ts: Date.now(),
-  }))
-  return path
+// The sweep acts only on what the transcript records as the user's answer.
+// Each scenario gets its own TMPDIR so the shared state dir (and the sweeps
+// other suites' hooks run against it) can't see or claim the seeded entries.
+const REJECTION = "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed."
+
+function rejectionLine(toolUseId) {
+  return JSON.stringify({
+    type: 'user', toolUseResult: 'User rejected tool use',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseId, is_error: true, content: REJECTION }] },
+  })
 }
 
-test('sweep: stale approval_required runState is cleaned locally (no network /deny)', async () => {
-  const stalePath = seedStaleAsk('sha256:stale')
+function seedSweepScenario({ toolUseId = 'tu_a', transcriptLines = [], ts = Date.now(), transcript = true } = {}) {
+  const fakeTmp = mkdtempSync(join(tmpdir(), 'vaibot-cc-sweep-'))
+  const stateDir = join(fakeTmp, 'vaibot-claudecode')
+  mkdirSync(join(stateDir, 'pending'), { recursive: true })
+  const transcriptPath = join(fakeTmp, 'session.jsonl')
+  writeFileSync(transcriptPath, transcriptLines.join('\n') + '\n')
+  const entryPath = join(stateDir, `${toolUseId}.json`)
+  writeFileSync(entryPath, JSON.stringify({
+    tool_name: 'Bash', tool_use_id: toolUseId, run_id: `run_${toolUseId}`,
+    content_hash: 'sha256:a', approval_required: true, intent_key: 'ik_a',
+    transcript_path: transcript ? transcriptPath : undefined, ts,
+  }))
+  const pointerPath = join(stateDir, 'pending', 'ik_a.json')
+  writeFileSync(pointerPath, JSON.stringify({ content_hash: 'sha256:a', ts }))
+  return { fakeTmp, transcriptPath, entryPath, pointerPath }
+}
+
+async function runSweepingCall(fakeTmp) {
   const server = await startMockServer(decideHandler({
     decision: { decision: 'allow' }, shadow_decision: { decision: 'allow' },
     content_hash: 'sha256:next', run_id: 'run_next',
   }))
   try {
-    await runHook({ apiUrl: server.url, input: {
+    await runHook({ apiUrl: server.url, extraEnv: { TMPDIR: fakeTmp }, input: {
       tool_name: 'Bash', tool_input: { command: uniqCmd('echo hi') },
-      session_id: 's', tool_use_id: 'tu_new',
+      session_id: 's', tool_use_id: 'tu_b',
     }})
-    // Guard approvals self-expire server-side; the sweep only removes stale
-    // local run-state — no /deny PATCH is issued.
-    const denies = server.requests.filter((r) => r.method === 'PATCH' && r.url.endsWith('/deny'))
-    assert.equal(denies.length, 0)
-    assert.ok(!existsSync(stalePath), 'stale ask-in-flight run-state cleaned')
+    return server.requests
   } finally {
     await server.close()
-    try { rmSync(stalePath) } catch {}
+  }
+}
+
+test('sweep: a parallel ask whose dialog is still up is left alone (entry + pointer survive)', async () => {
+  // No tool_result for tu_a yet: the user has not answered. Sweeping it here
+  // would leave a later "Yes" with nothing to finalize.
+  const sc = seedSweepScenario({ transcriptLines: [JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu_a' }] } })] })
+  try {
+    await runSweepingCall(sc.fakeTmp)
+    assert.ok(existsSync(sc.entryPath), 'open ask-in-flight entry kept')
+    assert.ok(existsSync(sc.pointerPath), 'its retry pointer kept')
+  } finally { rmSync(sc.fakeTmp, { recursive: true, force: true }) }
+})
+
+test('sweep: an ask the transcript records as rejected is resolved (entry + pointer removed, no network /deny)', async () => {
+  const sc = seedSweepScenario({ transcriptLines: [rejectionLine('tu_a')] })
+  try {
+    const requests = await runSweepingCall(sc.fakeTmp)
+    assert.ok(!existsSync(sc.entryPath), 'rejected entry swept')
+    assert.ok(!existsSync(sc.pointerPath), 'its retry pointer dropped')
+    // Guard approvals self-expire server-side; no /deny PATCH is issued.
+    assert.equal(requests.filter((r) => r.method === 'PATCH' && r.url.endsWith('/deny')).length, 0)
+  } finally { rmSync(sc.fakeTmp, { recursive: true, force: true }) }
+})
+
+test('sweep: a successful tool_result (Yes, PostToolUse not yet run) is not read as a rejection', async () => {
+  const ok = JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tu_a', content: 'done' }] } })
+  const sc = seedSweepScenario({ transcriptLines: [ok] })
+  try {
+    await runSweepingCall(sc.fakeTmp)
+    assert.ok(existsSync(sc.entryPath), 'left for its own PostToolUse')
+  } finally { rmSync(sc.fakeTmp, { recursive: true, force: true }) }
+})
+
+test('sweep: another call\'s rejection does not resolve this one', async () => {
+  const sc = seedSweepScenario({ transcriptLines: [rejectionLine('tu_other')] })
+  try {
+    await runSweepingCall(sc.fakeTmp)
+    assert.ok(existsSync(sc.entryPath))
+  } finally { rmSync(sc.fakeTmp, { recursive: true, force: true }) }
+})
+
+test('sweep: a rejection recorded in a subagent transcript resolves the entry', async () => {
+  const sc = seedSweepScenario()
+  const sub = join(sc.fakeTmp, 'session', 'subagents')
+  mkdirSync(sub, { recursive: true })
+  writeFileSync(join(sub, 'agent-x.jsonl'), rejectionLine('tu_a') + '\n')
+  try {
+    await runSweepingCall(sc.fakeTmp)
+    assert.ok(!existsSync(sc.entryPath))
+  } finally { rmSync(sc.fakeTmp, { recursive: true, force: true }) }
+})
+
+test('sweep: an entry with no verdict for over a day is dropped; a legacy entry without transcript_path is kept until then', async () => {
+  const old = seedSweepScenario({ transcript: false, ts: Date.now() - 25 * 60 * 60 * 1000 })
+  const fresh = seedSweepScenario({ transcript: false })
+  try {
+    await runSweepingCall(old.fakeTmp)
+    await runSweepingCall(fresh.fakeTmp)
+    assert.ok(!existsSync(old.entryPath), 'abandoned entry dropped')
+    assert.ok(existsSync(fresh.entryPath), 'unverifiable recent entry kept')
+  } finally {
+    rmSync(old.fakeTmp, { recursive: true, force: true })
+    rmSync(fresh.fakeTmp, { recursive: true, force: true })
+  }
+})
+
+test('runState records transcript_path from the hook input', async () => {
+  const fakeTmp = mkdtempSync(join(tmpdir(), 'vaibot-cc-sweep-'))
+  const server = await startMockServer(decideHandler({
+    decision: { decision: 'approval_required', reason: 'r' }, content_hash: 'sha256:t', run_id: 'run_t',
+  }))
+  try {
+    await runHook({ apiUrl: server.url, extraEnv: { TMPDIR: fakeTmp }, input: {
+      tool_name: 'Bash', tool_input: { command: uniqCmd('rm x') },
+      session_id: 's', tool_use_id: 'tu_t', transcript_path: '/t/session.jsonl',
+    }})
+    const state = JSON.parse(readFileSync(join(fakeTmp, 'vaibot-claudecode', 'tu_t.json'), 'utf-8'))
+    assert.equal(state.transcript_path, '/t/session.jsonl')
+  } finally {
+    await server.close()
+    rmSync(fakeTmp, { recursive: true, force: true })
   }
 })
 
