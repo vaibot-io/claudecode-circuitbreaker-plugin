@@ -2,6 +2,26 @@
 
 All notable changes to `@vaibot/claudecode-circuitbreaker-plugin`.
 
+## [Unreleased]
+
+### Fixed
+- **Every second gated edit to a file was denied `Approval not approved (status=pending)`.**
+  The retry pointer was keyed `tool | "Edit <file_path>" | cwd`, so all edits to one file
+  shared it, and a "Yes" in Claude Code's dialog never spent it. The edit after an
+  approved one presented the approved edit's approval id, which the guard still held as
+  `pending`, and the guard denied it. That deny cleared the pointer, so the next edit
+  prompted again: allowed, denied, allowed, denied. Re-running an identical approved
+  Bash command failed the same way.
+  - The pointer is now keyed on the exact call: tool, full input (stable key order) and
+    cwd. Different calls never share one. An identical retry after an approval from the
+    dashboard or email still finds its own.
+  - PostToolUse now treats a gated call reaching it as the user's "Yes". It deletes that
+    call's pointer and finalizes with `approval: "approved"`, the same field the deny
+    path uses.
+  - PostToolUse no longer falls back to "the newest entry for this tool" when the hook
+    input has a `tool_use_id` but that id has no entry. That entry belongs to a
+    different call, and finalizing it would record an approval nobody gave.
+
 ## [1.3.2] — 2026-09-28 — the governance exemption, and guard 2.3.0
 
 ### Changed

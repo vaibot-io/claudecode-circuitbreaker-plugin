@@ -13,11 +13,18 @@ const SCRIPT = join(__dirname, '..', 'scripts', 'pre-tool-use.mjs')
 
 // Mirror the pending path logic in pre-tool-use.mjs so tests can write/read
 // the same files without having to import the script (which has top-level await).
-function intentHash(tool, command, cwd) {
-  return createHash('sha256').update(`${tool}|${command ?? ''}|${cwd ?? ''}`).digest('hex').slice(0, 32)
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
 }
-function pendingPath(tool, command, cwd) {
-  return join(tmpdir(), 'vaibot-claudecode', 'pending', `${intentHash(tool, command, cwd)}.json`)
+function callKey(tool, input, cwd) {
+  return createHash('sha256').update(`${tool}|${stableStringify(input ?? {})}|${cwd ?? ''}`).digest('hex').slice(0, 32)
+}
+function pendingPath(tool, input, cwd) {
+  return join(tmpdir(), 'vaibot-claudecode', 'pending', `${callKey(tool, input, cwd)}.json`)
 }
 function nudgeMarkerPath(sessionId) {
   const safe = createHash('sha256').update(String(sessionId)).digest('hex').slice(0, 32)
@@ -226,8 +233,8 @@ test('enforce + deny → deny output, pending file cleared', async () => {
   const cmd = uniqCmd('rm -rf /tmp/customer-export')
   const cwd = process.cwd()
   // Seed a pending file to verify it gets cleared
-  mkdirSync(dirname(pendingPath('Bash', cmd, cwd)), { recursive: true })
-  writeFileSync(pendingPath('Bash', cmd, cwd), JSON.stringify({ content_hash: 'sha256:stale', ts: 0 }))
+  mkdirSync(dirname(pendingPath('Bash', { command: cmd, cwd }, cwd)), { recursive: true })
+  writeFileSync(pendingPath('Bash', { command: cmd, cwd }, cwd), JSON.stringify({ content_hash: 'sha256:stale', ts: 0 }))
 
   const server = await startMockServer((req) => {
     if (req.url === '/v1/decide/tool') {
@@ -259,7 +266,7 @@ test('enforce + deny → deny output, pending file cleared', async () => {
     assert.equal(out.hookSpecificOutput.permissionDecision, 'deny')
     // Pre-hook no longer finalizes on deny — the guard's decide receipt records
     // the verdict; finalize happens only for executed tools via post-tool-use.
-    assert.ok(!existsSync(pendingPath('Bash', cmd, cwd)), 'pending file cleared on deny')
+    assert.ok(!existsSync(pendingPath('Bash', { command: cmd, cwd }, cwd)), 'pending file cleared on deny')
   } finally { await server.close() }
 })
 
@@ -336,8 +343,8 @@ test('retry with pending pointer: server returns previously_approved=true → al
   const cmd = uniqCmd('curl -X POST https://deploy.example.com/release')
   const cwd = process.cwd()
   // Seed pending file (simulates a prior approval_required)
-  mkdirSync(dirname(pendingPath('Bash', cmd, cwd)), { recursive: true })
-  writeFileSync(pendingPath('Bash', cmd, cwd), JSON.stringify({ content_hash: 'sha256:appr', ts: Date.now() }))
+  mkdirSync(dirname(pendingPath('Bash', { command: cmd, cwd }, cwd)), { recursive: true })
+  writeFileSync(pendingPath('Bash', { command: cmd, cwd }, cwd), JSON.stringify({ content_hash: 'sha256:appr', ts: Date.now() }))
 
   const server = await startMockServer((req) => {
     if (req.url === '/v1/decide/tool') {
@@ -366,7 +373,7 @@ test('retry with pending pointer: server returns previously_approved=true → al
     assert.equal(res.code, 0)
     const out = JSON.parse(res.stdout)
     assert.equal(out.hookSpecificOutput.permissionDecision, 'allow')
-    assert.ok(!existsSync(pendingPath('Bash', cmd, cwd)), 'pending file cleared after consumed approval')
+    assert.ok(!existsSync(pendingPath('Bash', { command: cmd, cwd }, cwd)), 'pending file cleared after consumed approval')
   } finally { await server.close() }
 })
 
@@ -424,7 +431,7 @@ test('approval_required + claimed:false → stderr nudge written + marker create
   const cmd = uniqCmd('curl -X POST https://deploy.example.com/release')
   const cwd = process.cwd()
   const sessionId = `nudge-session-${Math.random().toString(36).slice(2)}`
-  try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+  try { rmSync(pendingPath('Bash', { command: cmd, cwd }, cwd)) } catch {}
   try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
 
   const server = await startMockServer((req) => {
@@ -469,7 +476,7 @@ test('approval_required + claimed:false → stderr nudge written + marker create
     assert.ok(existsSync(nudgeMarkerPath(sessionId)), 'nudge marker created')
   } finally {
     await server.close()
-    try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+    try { rmSync(pendingPath('Bash', { command: cmd, cwd }, cwd)) } catch {}
     try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
   }
 })
@@ -478,7 +485,7 @@ test('approval_required + claimed:true → no nudge', async () => {
   const cmd = uniqCmd('curl -X POST https://deploy.example.com/release')
   const cwd = process.cwd()
   const sessionId = `nudge-claimed-${Math.random().toString(36).slice(2)}`
-  try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+  try { rmSync(pendingPath('Bash', { command: cmd, cwd }, cwd)) } catch {}
   try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
 
   const server = await startMockServer((req) => {
@@ -517,7 +524,7 @@ test('approval_required + claimed:true → no nudge', async () => {
     assert.ok(!existsSync(nudgeMarkerPath(sessionId)), 'nudge marker NOT created')
   } finally {
     await server.close()
-    try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+    try { rmSync(pendingPath('Bash', { command: cmd, cwd }, cwd)) } catch {}
   }
 })
 
@@ -525,7 +532,7 @@ test('approval_required + nudge marker already present → no second nudge', asy
   const cmd = uniqCmd('curl -X POST https://deploy.example.com/release')
   const cwd = process.cwd()
   const sessionId = `nudge-twice-${Math.random().toString(36).slice(2)}`
-  try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+  try { rmSync(pendingPath('Bash', { command: cmd, cwd }, cwd)) } catch {}
 
   // Pre-seed the marker
   mkdirSync(dirname(nudgeMarkerPath(sessionId)), { recursive: true })
@@ -566,7 +573,7 @@ test('approval_required + nudge marker already present → no second nudge', asy
     assert.equal(meCalls, 0, '/accounts/me not called when marker already exists')
   } finally {
     await server.close()
-    try { rmSync(pendingPath('Bash', cmd, cwd)) } catch {}
+    try { rmSync(pendingPath('Bash', { command: cmd, cwd }, cwd)) } catch {}
     try { rmSync(nudgeMarkerPath(sessionId)) } catch {}
   }
 })
@@ -887,4 +894,117 @@ test('a corrupt containment record does not claim containment, and does not cras
   } finally {
     await server.close()
   }
+})
+
+// Regression: the pointer used to be keyed `tool | "Edit <file_path>" | cwd`, and
+// a native "Yes" never spent it. So the call after an approved edit presented that
+// edit's still-pending approval id, and the guard denied it as
+// `Approval not approved (status=pending)` — every second edit to a file failed.
+// Runs PreToolUse and PostToolUse against one isolated TMPDIR, the way Claude Code
+// runs them: ask → Yes (PostToolUse) → identical retry → a different edit.
+test('native Yes spends the pointer; a different edit to the same file never inherits it', async () => {
+  const fakeTmp = mkdtempSync(join(tmpdir(), 'vaibot-cc-yes-'))
+  const cwd = process.cwd()
+  const file = join(cwd, `yes-${Math.random().toString(36).slice(2)}.md`)
+  const editA = { file_path: file, old_string: 'one', new_string: 'two' }
+  const editB = { file_path: file, old_string: 'three', new_string: 'four' }
+  const pointerFor = (input) => join(fakeTmp, 'vaibot-claudecode', 'pending', `${callKey('Edit', input, cwd)}.json`)
+
+  let n = 0
+  const server = await startMockServer((req) => {
+    if (req.url !== '/v1/decide/tool') return { status: 200, body: { ok: true } }
+    n += 1
+    return { status: 200, body: {
+      ok: true, runId: `run_yes_${n}`, risk: { risk: 'high' },
+      decision: { decision: 'approve', reason: 'File mutation outside workspace', approvalId: `appr_yes_${n}` },
+    } }
+  })
+  const pre = (input, toolUseId) => runHook({ apiUrl: server.url, extraEnv: { TMPDIR: fakeTmp }, input: {
+    tool_name: 'Edit', tool_input: input, session_id: 's-yes', tool_use_id: toolUseId,
+  } })
+  const post = (toolUseId) => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [join(__dirname, '..', 'scripts', 'post-tool-use.mjs')], {
+      env: { ...process.env, TMPDIR: fakeTmp, VAIBOT_GUARD_BASE_URL: server.url, VAIBOT_GUARD_TOKEN: 'test-guard-token', VAIBOT_TIMEOUT_MS: '2000' },
+      stdio: ['pipe', 'ignore', 'ignore'],
+    })
+    child.on('error', reject)
+    child.on('exit', resolve)
+    child.stdin.end(JSON.stringify({ tool_name: 'Edit', tool_use_id: toolUseId }))
+  })
+  const decides = () => server.requests.filter((r) => r.url === '/v1/decide/tool')
+
+  try {
+    // 1. Edit A is gated → native ask, pointer saved for out-of-band approval.
+    const a = await pre(editA, 'tu_yes_a')
+    assert.equal(JSON.parse(a.stdout).hookSpecificOutput.permissionDecision, 'ask')
+    assert.ok(existsSync(pointerFor(editA)), 'pointer saved for the gated call')
+
+    // 2. The user clicks Yes → PostToolUse finalizes A as approved and drops
+    //    A's pointer.
+    await post('tu_yes_a')
+    const fin = server.requests.filter((r) => r.url === '/v1/finalize/tool')
+    assert.equal(fin.length, 1)
+    assert.equal(fin[0].body.runId, 'run_yes_1')
+    assert.equal(fin[0].body.result.approval, 'approved')
+    assert.ok(!existsSync(pointerFor(editA)), 'a native Yes spends the pointer')
+
+    // 3. The next edit to the same file gets a fresh decision — this is the
+    //    call that used to be denied `status=pending`.
+    const b = await pre(editB, 'tu_yes_b')
+    assert.equal(JSON.parse(b.stdout).hookSpecificOutput.permissionDecision, 'ask')
+    assert.equal(decides().at(-1).body.approval?.approvalId, undefined, 'edit B must not present edit A\'s approval')
+    await post('tu_yes_b')
+
+    // 4. Re-running the identical call (e.g. the same `npm test`) also gets a
+    //    fresh decision, not a redemption of the approval the Yes already used.
+    const a2 = await pre(editA, 'tu_yes_a2')
+    assert.equal(JSON.parse(a2.stdout).hookSpecificOutput.permissionDecision, 'ask')
+    assert.equal(decides().at(-1).body.approval?.approvalId, undefined, 'spent approval is not re-presented')
+  } finally {
+    await server.close()
+    try { rmSync(fakeTmp, { recursive: true, force: true }) } catch {}
+  }
+})
+
+test('a live pointer for one edit is never presented for a different edit to the same file', async () => {
+  const fakeTmp = mkdtempSync(join(tmpdir(), 'vaibot-cc-key-'))
+  const cwd = process.cwd()
+  const file = join(cwd, `key-${Math.random().toString(36).slice(2)}.md`)
+  const editA = { file_path: file, old_string: 'one', new_string: 'two' }
+  const editB = { file_path: file, old_string: 'three', new_string: 'four' }
+  // A's approval is still outstanding (e.g. waiting on the dashboard).
+  const pointerA = join(fakeTmp, 'vaibot-claudecode', 'pending', `${callKey('Edit', editA, cwd)}.json`)
+  mkdirSync(dirname(pointerA), { recursive: true })
+  writeFileSync(pointerA, JSON.stringify({ content_hash: 'appr_outstanding', ts: Date.now() }))
+
+  const server = await startMockServer((req) => req.url === '/v1/decide/tool'
+    ? { status: 200, body: { ok: true, runId: 'run_key_b', risk: { risk: 'high' },
+        decision: { decision: 'approve', reason: 'gated', approvalId: 'appr_key_b' } } }
+    : { status: 200, body: { ok: true } })
+  try {
+    await runHook({ apiUrl: server.url, extraEnv: { TMPDIR: fakeTmp }, input: {
+      tool_name: 'Edit', tool_input: editB, session_id: 's-key', tool_use_id: 'tu_key_b',
+    } })
+    const decide = server.requests.find((r) => r.url === '/v1/decide/tool')
+    assert.equal(decide.body.approval?.approvalId, undefined)
+    assert.ok(existsSync(pointerA), 'A\'s outstanding pointer is left for A')
+  } finally {
+    await server.close()
+    try { rmSync(fakeTmp, { recursive: true, force: true }) } catch {}
+  }
+})
+
+test('the pointer key is the exact call: key order is irrelevant, any value change is a new key', () => {
+  const cwd = '/w'
+  const a = { file_path: '/w/f.md', old_string: 'x', new_string: 'y' }
+  const reordered = { new_string: 'y', old_string: 'x', file_path: '/w/f.md' }
+  assert.equal(callKey('Edit', a, cwd), callKey('Edit', reordered, cwd))
+  assert.notEqual(callKey('Edit', a, cwd), callKey('Edit', { ...a, new_string: 'z' }, cwd))
+  assert.notEqual(callKey('Edit', a, cwd), callKey('Write', a, cwd))
+  assert.notEqual(callKey('Edit', a, cwd), callKey('Edit', a, '/other'))
+  // Nested values count too (a top-level-keys-only replacer would drop them).
+  assert.notEqual(
+    callKey('MultiEdit', { edits: [{ old_string: 'a', new_string: 'b' }] }, cwd),
+    callKey('MultiEdit', { edits: [{ old_string: 'a', new_string: 'c' }] }, cwd),
+  )
 })

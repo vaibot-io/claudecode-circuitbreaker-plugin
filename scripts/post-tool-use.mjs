@@ -34,6 +34,7 @@ function resolveGuard() {
 }
 
 const STATE_DIR = join(tmpdir(), 'vaibot-claudecode')
+const PENDING_DIR = join(STATE_DIR, 'pending')
 const MAX_STATE_AGE_MS = 5 * 60 * 1000 // 5 minutes
 
 function findRunState(toolName, toolUseId) {
@@ -55,12 +56,15 @@ function findRunState(toolName, toolUseId) {
           continue
         }
 
-        // Prefer exact tool_use_id match; fall back to most-recent tool_name.
+        // Exact tool_use_id match. The most-recent-tool_name fallback is only
+        // for hook input that carries no id: when this call HAS an id and its
+        // entry is gone (swept), the newest same-tool entry is a DIFFERENT
+        // call — finalizing it would report an approval nobody gave.
         if (toolUseId && data.tool_use_id === toolUseId) {
           bestMatch = { ...data, file }
           break
         }
-        if (data.tool_name === toolName && data.ts > bestTs) {
+        if (!toolUseId && data.tool_name === toolName && data.ts > bestTs) {
           bestMatch = { ...data, file }
           bestTs = data.ts
         }
@@ -111,12 +115,21 @@ async function main() {
   const runState = findRunState(toolName, toolUseId)
   if (!runState?.run_id) process.exit(0)
 
+  // PostToolUse firing for an ask-in-flight means the user clicked "Yes" in
+  // Claude Code's native UI. That answer resolves the gate, so the call's
+  // pending pointer is spent: left behind, the next identical call would
+  // present the guard's still-pending approval id, and the guard denies an
+  // unresolved approval (`Approval not approved (status=pending)`). Dropped
+  // before the guard lookup so it goes even when the guard is unreachable.
+  const nativelyApproved = runState.approval_required === true
+  if (nativelyApproved && runState.intent_key) {
+    try { unlinkSync(join(PENDING_DIR, `${runState.intent_key}.json`)) } catch { /* may not exist */ }
+  }
+
   // Receipt exists and needs closing — having no API key here is a real problem,
   // not a silent skip. Warn so the user sees the receipt will be left open.
   // Direction A: finalize through the local guard (it proves the finalize
   // receipt). The guard recovers the session from the runId's stored context.
-  // The 'ask' approval the user granted in Claude Code's native UI is captured
-  // by the finalize receipt; the guard's pending approval record self-expires.
   const guard = resolveGuard()
   if (!guard) {
     process.stderr.write(
@@ -127,6 +140,9 @@ async function main() {
 
   const outcome = error ? 'blocked' : 'allowed'
   const result = { outcome }
+  // The answer the user gave, stated rather than inferred: the deny path
+  // already reports `approval: 'denied'` through this same endpoint.
+  if (nativelyApproved) result.approval = 'approved'
   if (typeof durationMs === 'number') result.duration_ms = durationMs
   if (error) result.error = String(error).slice(0, 2000)
 
