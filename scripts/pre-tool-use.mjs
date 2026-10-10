@@ -35,6 +35,7 @@ import { classify, VERDICT } from '../vendor/vaibot-guard/scripts/classifier.mjs
 import { ensureGuardDefault } from '../vendor/vaibot-guard/scripts/lib/guard-launch.mjs'
 import { decideViaGuard } from '../vendor/vaibot-guard/scripts/lib/guard-client.mjs'
 import { readContainment } from '../vendor/vaibot-guard/scripts/lib/guard-bootstrap.mjs'
+import { resolveAsk, ASK_OPEN } from './lib/ask-resolution.mjs'
 import { createRequire } from 'node:module'
 
 const nodeRequire = createRequire(import.meta.url)
@@ -381,10 +382,14 @@ function saveRunState(toolCallId, state) {
 // ── Ask-in-flight sweep ────────────────────────────────────────────────────
 // When PreToolUse emitted `permissionDecision: 'ask'`, the runState carries
 // `approval_required: true`. If the user clicks "Yes", PostToolUse fires and
-// consumes the entry (calling PATCH /approve). If the user clicks "No, tell
-// Claude", PostToolUse never fires — the entry remains until the next hook
-// (PreToolUse of a later call, Stop, or SubagentStop) sweeps it and calls
-// PATCH /deny.
+// consumes the entry. If the user clicks "No, tell Claude", no hook fires —
+// the entry remains until the next hook (PreToolUse of a later call, Stop, or
+// SubagentStop) sweeps it.
+//
+// The sweep acts only on an entry the transcript shows was REJECTED (see
+// lib/ask-resolution.mjs). Any other entry may belong to a call whose dialog is
+// still up — a parallel call, a subagent, another session — and is left for
+// its own PostToolUse.
 //
 // Race note: claim the entry by unlinking it BEFORE issuing the network call.
 // Whichever process wins the unlink owns the resolution; the loser (e.g. a
@@ -404,7 +409,7 @@ async function sweepPendingApprovals({ excludeToolUseId } = {}) {
 
     if (!entry?.approval_required) continue
     if (excludeToolUseId && entry.tool_use_id === excludeToolUseId) continue
-    if (!entry.content_hash) { try { unlinkSync(path) } catch {} ; continue }
+    if (resolveAsk(entry) === ASK_OPEN) continue  // dialog may still be up
 
     try { unlinkSync(path) } catch { continue }  // lost the race — another hook is handling it
 
@@ -573,6 +578,7 @@ async function main() {
   const toolInput = hookInput.tool_input ?? hookInput.toolInput ?? {}
   const sessionId = hookInput.session_id ?? hookInput.sessionId ?? `cc-${Date.now()}`
   const toolUseId = hookInput.tool_use_id ?? hookInput.toolUseId ?? null
+  const transcriptPath = typeof hookInput.transcript_path === 'string' ? hookInput.transcript_path : null
 
   // Governance tools are exempt so a governance call cannot recurse into governing
   // itself, and so an operator can still lift containment from inside the agent.
@@ -629,9 +635,8 @@ async function main() {
     }
   }
 
-  // Resolve any still-pending ask-in-flight from a prior tool call. If the user
-  // clicked "No, tell Claude" on a previous `ask`, no PostToolUse fired — so
-  // this sweep is the first place the denial gets recorded server-side.
+  // Resolve any ask-in-flight the user has rejected. "No, tell Claude" fires no
+  // PostToolUse, so this sweep is the first hook that can see the answer.
   await sweepPendingApprovals({ excludeToolUseId: toolUseId })
 
   // ── Breaker check (before any API call) ──
@@ -752,6 +757,8 @@ async function main() {
       tool_name: toolName,
       tool_call_id: toolCallId,
       tool_use_id: toolUseId,
+      // Where the user's answer to an ask lands; the sweeps read it.
+      transcript_path: transcriptPath,
       approval_required: rawDecision === 'approval_required' && !data.previously_approved,
       intent_key: intentHash(toolName, command, cwd),
       ts: Date.now(),
