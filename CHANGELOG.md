@@ -21,6 +21,20 @@ All notable changes to `@vaibot/claudecode-circuitbreaker-plugin`.
   - PostToolUse no longer falls back to "the newest entry for this tool" when the hook
     input has a `tool_use_id` but that id has no entry. That entry belongs to a
     different call, and finalizing it would record an approval nobody gave.
+- **A pending approval dialog is no longer treated as a "No".** The ask-in-flight sweeps
+  (PreToolUse of any later call, Stop, SubagentStop) resolved *every* ask entry in the
+  shared state dir. That included a call whose dialog was still open: a parallel call,
+  a subagent's call, or one from another Claude Code session. Its run-state and retry
+  pointer were deleted, so a later "Yes" had nothing to finalize. Stop also PATCHed a
+  denial for it.
+
+  The sweeps now act only on evidence. Claude Code records a rejection in the session
+  transcript as the call's `tool_result` (`is_error: true`, "The user doesn't want to
+  proceed…"), and only that record, matched by the call's own `tool_use_id`, counts as a
+  "No". Subagent transcripts are searched too. Run-state now stores the hook's
+  `transcript_path`. An entry with no verdict is left alone. After 24 h it is dropped
+  without recording a denial. The transcript is written asynchronously, so a rejection
+  not yet flushed is simply picked up by a later sweep.
 
 ## [1.3.2] — 2026-09-28 — the governance exemption, and guard 2.3.0
 

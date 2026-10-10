@@ -18,6 +18,7 @@ import { readFileSync, readdirSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { resolveCredentials } from '../vendor/vaibot-guard/scripts/lib/creds.mjs'
+import { resolveAsk, ASK_OPEN, ASK_REJECTED } from './lib/ask-resolution.mjs'
 
 const resolved = resolveCredentials()
 const API_URL = resolved.apiBaseUrl
@@ -45,15 +46,24 @@ async function main() {
 
     if (!entry?.approval_required || !entry.content_hash) continue
 
+    // Only a rejection the transcript records is a denial. Any other entry may
+    // be a call whose dialog is still up (a subagent ending, or another session
+    // sharing the state dir) — leave it for its own PostToolUse.
+    const verdict = resolveAsk(entry)
+    if (verdict === ASK_OPEN) continue
+
     try { unlinkSync(path) } catch { continue }  // lost race to another hook
 
-    try {
-      await fetch(`${API_URL}/v2/receipts/${encodeURIComponent(entry.content_hash)}/deny`, {
-        method: 'PATCH',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${API_KEY}` },
-        signal: AbortSignal.timeout(TIMEOUT_MS),
-      })
-    } catch { /* best-effort */ }
+    // Abandoned: nobody is known to have said no, so record nothing.
+    if (verdict === ASK_REJECTED) {
+      try {
+        await fetch(`${API_URL}/v2/receipts/${encodeURIComponent(entry.content_hash)}/deny`, {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${API_KEY}` },
+          signal: AbortSignal.timeout(TIMEOUT_MS),
+        })
+      } catch { /* best-effort */ }
+    }
 
     if (entry.intent_key) {
       try { unlinkSync(join(PENDING_DIR, `${entry.intent_key}.json`)) } catch {}
