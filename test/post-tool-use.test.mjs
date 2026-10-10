@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
-import { writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { writeFileSync, mkdirSync, mkdtempSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -96,6 +96,38 @@ test('runState → finalize via guard /v1/finalize/tool, no V2 calls', async () 
     const finalizes = server.requests.filter((r) => r.url === '/v1/finalize/tool')
     assert.equal(finalizes.length, 1)
     assert.equal(finalizes[0].body.result?.outcome, 'allowed')
+  } finally {
+    await server.close()
+    try { rmSync(fakeTmp, { recursive: true, force: true }) } catch {}
+  }
+})
+
+// When this call's own entry is gone (swept by another hook), the newest entry
+// for the same tool belongs to a DIFFERENT call. Finalizing it would record an
+// approval for a call the user has not answered, and drop that call's pointer.
+test('a call whose entry is gone does not finalize a different call of the same tool', async () => {
+  const fakeTmp = mkdtempSync(join(tmpdir(), 'vaibot-cc-post-'))
+  seedRunState(fakeTmp, 'tu_other', true, 'appr_other')
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    await runPost({ apiUrl: server.url, input: { tool_name: 'Bash', tool_use_id: 'tu_swept' }, fakeTmp })
+    assert.equal(server.requests.filter((r) => r.url === '/v1/finalize/tool').length, 0)
+    assert.ok(existsSync(join(fakeTmp, 'vaibot-claudecode', 'tu_other.json')), 'the other call\'s entry is untouched')
+  } finally {
+    await server.close()
+    try { rmSync(fakeTmp, { recursive: true, force: true }) } catch {}
+  }
+})
+
+test('an ordinary (ungated) run is finalized without an approval claim', async () => {
+  const fakeTmp = mkdtempSync(join(tmpdir(), 'vaibot-cc-post-'))
+  seedRunState(fakeTmp, 'tu_plain', false)
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    await runPost({ apiUrl: server.url, input: { tool_name: 'Bash', tool_use_id: 'tu_plain' }, fakeTmp })
+    const fin = server.requests.filter((r) => r.url === '/v1/finalize/tool')
+    assert.equal(fin.length, 1)
+    assert.equal(fin[0].body.result.approval, undefined)
   } finally {
     await server.close()
     try { rmSync(fakeTmp, { recursive: true, force: true }) } catch {}

@@ -422,36 +422,51 @@ async function sweepPendingApprovals({ excludeToolUseId } = {}) {
 }
 
 // ── Pending-approval state (retry awareness) ────────────────────────────────
-// Untrusted hint only. The server re-verifies intent (tool + command + cwd)
-// against the referenced approved receipt before honoring a short-circuit, so
-// a tampered file here cannot redirect an approval onto a different intent.
+// Untrusted hint only. The guard re-verifies the referenced approval against
+// this exact call (its paramsHash) before honoring a short-circuit, so a
+// tampered file here cannot redirect an approval onto a different call.
+//
+// Keyed on the EXACT call — tool, full input, cwd — not on a summary of it.
+// The key used to be `tool | "Edit <file_path>" | cwd`, so every edit to one
+// file shared a pointer: the edit after a native "Yes" presented the previous
+// edit's still-pending approval id, and the guard denied it as
+// `Approval not approved (status=pending)`. Two different calls can never
+// share a pointer now; a retry of the identical call still finds its own.
 
-function intentHash(tool, command, cwd) {
-  return createHash('sha256').update(`${tool}|${command ?? ''}|${cwd ?? ''}`).digest('hex').slice(0, 32)
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
 }
 
-function pendingPath(tool, command, cwd) {
-  return join(PENDING_DIR, `${intentHash(tool, command, cwd)}.json`)
+function callKey(tool, input, cwd) {
+  return createHash('sha256').update(`${tool}|${stableStringify(input ?? {})}|${cwd ?? ''}`).digest('hex').slice(0, 32)
 }
 
-function readPendingApproval(tool, command, cwd) {
+function pendingPath(tool, input, cwd) {
+  return join(PENDING_DIR, `${callKey(tool, input, cwd)}.json`)
+}
+
+function readPendingApproval(tool, input, cwd) {
   try {
-    const p = pendingPath(tool, command, cwd)
+    const p = pendingPath(tool, input, cwd)
     if (!existsSync(p)) return null
     return JSON.parse(readFileSync(p, 'utf-8'))
   } catch { return null }
 }
 
-function writePendingApproval(tool, command, cwd, contentHash) {
+function writePendingApproval(tool, input, cwd, contentHash) {
   try {
     ensureStateDir()
     mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
-    writeFileSync(pendingPath(tool, command, cwd), JSON.stringify({ content_hash: contentHash, ts: Date.now() }), { mode: 0o600 })
+    writeFileSync(pendingPath(tool, input, cwd), JSON.stringify({ content_hash: contentHash, ts: Date.now() }), { mode: 0o600 })
   } catch { /* best-effort */ }
 }
 
-function clearPendingApproval(tool, command, cwd) {
-  try { unlinkSync(pendingPath(tool, command, cwd)) } catch { /* may not exist */ }
+function clearPendingApproval(tool, input, cwd) {
+  try { unlinkSync(pendingPath(tool, input, cwd)) } catch { /* may not exist */ }
 }
 
 // ── Onboarding nudge (one-shot per session) ────────────────────────────────
@@ -657,14 +672,14 @@ async function main() {
 
   // Retry awareness: if we previously got approval_required for this exact
   // intent and saved a pointer, present it to the guard for redemption.
-  const pending = readPendingApproval(toolName, command, cwd)
+  const pending = readPendingApproval(toolName, toolInput, cwd)
 
   if (process.env.VAIBOT_DEBUG === '1') {
-    const ih = intentHash(toolName, command, cwd)
-    const pp = pendingPath(toolName, command, cwd)
+    const ck = callKey(toolName, toolInput, cwd)
+    const pp = pendingPath(toolName, toolInput, cwd)
     process.stderr.write(
       `VAIBot [debug] pre: tool=${toolName} cwd=${cwd} cmd=${(command ?? '').slice(0, 80)}\n` +
-      `VAIBot [debug] pre: intentHash=${ih} pendingFile=${pp} pendingExists=${existsSync(pp)} sentApproved=${pending?.content_hash ?? 'none'}\n`
+      `VAIBot [debug] pre: callKey=${ck} pendingFile=${pp} pendingExists=${existsSync(pp)} sentApproved=${pending?.content_hash ?? 'none'}\n`
     )
   }
 
@@ -760,7 +775,7 @@ async function main() {
       // Where the user's answer to an ask lands; the sweeps read it.
       transcript_path: transcriptPath,
       approval_required: rawDecision === 'approval_required' && !data.previously_approved,
-      intent_key: intentHash(toolName, command, cwd),
+      intent_key: callKey(toolName, toolInput, cwd),
       ts: Date.now(),
     })
 
@@ -794,7 +809,7 @@ async function main() {
 
     if (decision === 'allow') {
       // Approval was consumed (or never needed) — clear pending state.
-      clearPendingApproval(toolName, command, cwd)
+      clearPendingApproval(toolName, toolInput, cwd)
       const output = {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
@@ -809,14 +824,12 @@ async function main() {
       const reason = rawReason ?? `Approval required for ${toolName}`
       const contentHash = data.content_hash ?? ''
       const riskLabel = data.risk?.risk ?? 'elevated'
-      // Save pointer so a retry of this exact intent can short-circuit if the
+      // Save pointer so a retry of this exact call can short-circuit if the
       // user later approves from the dashboard instead of the native UI.
-      if (contentHash) writePendingApproval(toolName, command, cwd, contentHash)
-      // Route through Claude Code's native ask UI. The receipt stays in
-      // `pending` state server-side: if the user picks Yes, PostToolUse will
-      // PATCH /approve; if No, the next hook will sweep + PATCH /deny.
-      // No finalize here — that would close the receipt prematurely and the
-      // subsequent approve/deny PATCHes would return 404.
+      if (contentHash) writePendingApproval(toolName, toolInput, cwd, contentHash)
+      // Route through Claude Code's native ask UI. No finalize here — the run
+      // stays open until the user answers: Yes → PostToolUse finalizes it as
+      // approved and drops the pointer; No → the next hook's sweep drops it.
       const output = {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
@@ -834,7 +847,7 @@ async function main() {
     if (decision === 'deny') {
       const reason = rawReason ?? `Denied by policy for ${toolName}`
       // Hard-deny means even prior approval is irrelevant for this intent.
-      clearPendingApproval(toolName, command, cwd)
+      clearPendingApproval(toolName, toolInput, cwd)
       const output = {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
