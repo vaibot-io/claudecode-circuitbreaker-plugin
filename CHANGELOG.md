@@ -36,6 +36,19 @@ All notable changes to `@vaibot/claudecode-circuitbreaker-plugin`.
   without recording a denial. The transcript is written asynchronously, so a rejection
   not yet flushed is simply picked up by a later sweep.
 
+- **A call that fails after it was allowed is now finalized.** Claude Code fires
+  `PostToolUseFailure`, not `PostToolUse`, when a tool that was allowed to run then
+  fails (a non-zero Bash exit, an edit that can't apply, an interrupt). The plugin
+  registered only `PostToolUse`, so these runs were never finalized. An ungated one
+  expired after 5 minutes. One the user had approved was left for the ask sweep, which
+  recorded it as a "No" before the sweep fix above, and afterwards held it for 24 h.
+  `PostToolUseFailure` now runs the PostToolUse script. A failed call is finalized
+  `ok: false` with its error (prefixed `[interrupted]` for an abort). After an ask, it
+  is also finalized `approval: "approved"` and its retry pointer is spent. A permission
+  denial returns before the tool runs, so this event is never a "No". This was checked
+  against the Claude Code 2.1.296 bundle: the hook is called only from the `catch`
+  around the tool's own execution.
+
 ## [1.3.2] — 2026-09-28 — the governance exemption, and guard 2.3.0
 
 ### Changed
