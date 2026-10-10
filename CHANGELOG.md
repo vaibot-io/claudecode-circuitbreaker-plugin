@@ -49,6 +49,22 @@ All notable changes to `@vaibot/claudecode-circuitbreaker-plugin`.
   against the Claude Code 2.1.296 bundle: the hook is called only from the `catch`
   around the tool's own execution.
 
+- **A "No" in Claude Code's approval dialog now reaches the receipt chain.** "No, tell
+  Claude" fires no PostToolUse, so the run was never finalized and the rejection was
+  never recorded. The Stop hook PATCHed `/v2/receipts/:hash/deny` in the cloud, but the
+  only id a hook holds is the guard's local `approvalId`, and no cloud receipt exists
+  before finalize, so that call could only 404, silently. The PreToolUse sweep made no
+  call at all.
+
+  Both sweeps now finalize the run through the **local guard** with
+  `{ outcome: "denied_by_reviewer", approval: "denied" }`. That's the same path
+  PostToolUse takes on "Yes", and it's keyed on `run_id`. The guard writes a "Denied in
+  the agent session" receipt and burns the approval record, so a retry can't redeem a
+  refused approval (verified end to end against the vendored 2.3.0 guard). This applies
+  only to a rejection the transcript records. An unanswered dialog is left alone, and an
+  abandoned entry is dropped with nothing claimed. The PreToolUse sweep still runs before
+  the breaker check, so a tripped breaker doesn't swallow a rejection.
+
 ## [1.3.2] — 2026-09-28 — the governance exemption, and guard 2.3.0
 
 ### Changed

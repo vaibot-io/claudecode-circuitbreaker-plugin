@@ -349,25 +349,31 @@ async function runSweepingCall(fakeTmp) {
   }
 }
 
+// The sweep's denial finalize, as distinct from anything the sweeping call does.
+const deniedFinalizes = (requests) => requests.filter((r) => r.url === '/v1/finalize/tool' && r.body?.result?.approval === 'denied')
+
 test('sweep: a parallel ask whose dialog is still up is left alone (entry + pointer survive)', async () => {
   // No tool_result for tu_a yet: the user has not answered. Sweeping it here
   // would leave a later "Yes" with nothing to finalize.
   const sc = seedSweepScenario({ transcriptLines: [JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu_a' }] } })] })
   try {
-    await runSweepingCall(sc.fakeTmp)
+    const requests = await runSweepingCall(sc.fakeTmp)
+    assert.equal(deniedFinalizes(requests).length, 0, 'nothing recorded for an unanswered dialog')
     assert.ok(existsSync(sc.entryPath), 'open ask-in-flight entry kept')
     assert.ok(existsSync(sc.pointerPath), 'its retry pointer kept')
   } finally { rmSync(sc.fakeTmp, { recursive: true, force: true }) }
 })
 
-test('sweep: an ask the transcript records as rejected is resolved (entry + pointer removed, no network /deny)', async () => {
+test('sweep: a recorded rejection is finalized through the guard as denied (entry + pointer removed, no cloud PATCH)', async () => {
   const sc = seedSweepScenario({ transcriptLines: [rejectionLine('tu_a')] })
   try {
     const requests = await runSweepingCall(sc.fakeTmp)
     assert.ok(!existsSync(sc.entryPath), 'rejected entry swept')
     assert.ok(!existsSync(sc.pointerPath), 'its retry pointer dropped')
-    // Guard approvals self-expire server-side; no /deny PATCH is issued.
-    assert.equal(requests.filter((r) => r.method === 'PATCH' && r.url.endsWith('/deny')).length, 0)
+    const fin = deniedFinalizes(requests)
+    assert.equal(fin.length, 1)
+    assert.deepEqual(fin[0].body, { sessionId: 'claude-code', runId: 'run_tu_a', result: { outcome: 'denied_by_reviewer', approval: 'denied' } })
+    assert.equal(requests.filter((r) => r.method === 'PATCH').length, 0)
   } finally { rmSync(sc.fakeTmp, { recursive: true, force: true }) }
 })
 
@@ -403,9 +409,10 @@ test('sweep: an entry with no verdict for over a day is dropped; a legacy entry 
   const old = seedSweepScenario({ transcript: false, ts: Date.now() - 25 * 60 * 60 * 1000 })
   const fresh = seedSweepScenario({ transcript: false })
   try {
-    await runSweepingCall(old.fakeTmp)
+    const oldRequests = await runSweepingCall(old.fakeTmp)
     await runSweepingCall(fresh.fakeTmp)
     assert.ok(!existsSync(old.entryPath), 'abandoned entry dropped')
+    assert.equal(deniedFinalizes(oldRequests).length, 0, 'abandoned: no denial claimed')
     assert.ok(existsSync(fresh.entryPath), 'unverifiable recent entry kept')
   } finally {
     rmSync(old.fakeTmp, { recursive: true, force: true })

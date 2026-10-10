@@ -35,7 +35,7 @@ import { classify, VERDICT } from '../vendor/vaibot-guard/scripts/classifier.mjs
 import { ensureGuardDefault } from '../vendor/vaibot-guard/scripts/lib/guard-launch.mjs'
 import { decideViaGuard } from '../vendor/vaibot-guard/scripts/lib/guard-client.mjs'
 import { readContainment } from '../vendor/vaibot-guard/scripts/lib/guard-bootstrap.mjs'
-import { resolveAsk, ASK_OPEN } from './lib/ask-resolution.mjs'
+import { resolveAsk, ASK_OPEN, ASK_REJECTED } from './lib/ask-resolution.mjs'
 import { createRequire } from 'node:module'
 
 const nodeRequire = createRequire(import.meta.url)
@@ -396,7 +396,33 @@ function saveRunState(toolCallId, state) {
 // PostToolUse running in parallel) sees ENOENT and bails out. This keeps the
 // receipt event chain coherent even if hook processes overlap.
 
-async function sweepPendingApprovals({ excludeToolUseId } = {}) {
+// Record a rejected ask by finalizing the run through the LOCAL GUARD — the
+// same path PostToolUse takes on "Yes" — so the receipt is written by the
+// component that owns the run context. The guard reads `approval: "denied"` as
+// the human's answer: the receipt says "Denied in the agent session", and the
+// guard burns the approval record so a retry cannot redeem it.
+//
+// Not a cloud PATCH: the only id a hook holds for a gated call is the guard's
+// local approvalId, while the API keys receipts by content_hash, and no cloud
+// receipt exists yet anyway — the guard posts it at finalize.
+async function finalizeRejectedAsk(entry, cwd) {
+  const guard = await resolveGuardTarget(cwd)
+  if (!guard) return
+  try {
+    await fetch(`http://${guard.host}:${guard.port}/v1/finalize/tool`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${guard.token}` },
+      body: JSON.stringify({
+        sessionId: 'claude-code',
+        runId: entry.run_id,
+        result: { outcome: 'denied_by_reviewer', approval: 'denied' },
+      }),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    })
+  } catch { /* best-effort — bookkeeping must never block the session */ }
+}
+
+async function sweepPendingApprovals({ excludeToolUseId, cwd } = {}) {
   let files
   try {
     files = readdirSync(STATE_DIR).filter((f) => f.endsWith('.json'))
@@ -409,12 +435,16 @@ async function sweepPendingApprovals({ excludeToolUseId } = {}) {
 
     if (!entry?.approval_required) continue
     if (excludeToolUseId && entry.tool_use_id === excludeToolUseId) continue
-    if (resolveAsk(entry) === ASK_OPEN) continue  // dialog may still be up
+    const verdict = resolveAsk(entry)
+    if (verdict === ASK_OPEN) continue  // dialog may still be up
 
     try { unlinkSync(path) } catch { continue }  // lost the race — another hook is handling it
 
-    // Guard approvals self-expire server-side; the sweep only cleans stale
-    // local run-state (no network call).
+    // Only an evidenced "No" is recorded. An abandoned entry is dropped with
+    // nothing claimed; its guard approval self-expires. run_id is what the
+    // guard finalizes against — without it there is nothing to record.
+    if (verdict === ASK_REJECTED && entry.run_id) await finalizeRejectedAsk(entry, cwd)
+
     if (entry.intent_key) {
       try { unlinkSync(join(PENDING_DIR, `${entry.intent_key}.json`)) } catch {}
     }
@@ -652,7 +682,9 @@ async function main() {
 
   // Resolve any ask-in-flight the user has rejected. "No, tell Claude" fires no
   // PostToolUse, so this sweep is the first hook that can see the answer.
-  await sweepPendingApprovals({ excludeToolUseId: toolUseId })
+  // Runs BEFORE the breaker check on purpose: a tripped breaker exits early,
+  // and a rejection still has to reach the receipt chain.
+  await sweepPendingApprovals({ excludeToolUseId: toolUseId, cwd: extractCwd(toolName, toolInput) })
 
   // ── Breaker check (before any API call) ──
   // Load persisted state from disk and check trip. Tripped → decide locally and
