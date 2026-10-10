@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * VAIBot Claude Code PostToolUse hook.
+ * VAIBot Claude Code PostToolUse / PostToolUseFailure hook.
  *
  * Reads the tool result from stdin (JSON), finds the matching run state saved
  * by pre-tool-use, and finalizes through the local VAIBot guard's
@@ -98,7 +98,14 @@ async function main() {
 
   const toolName = hookInput.tool_name ?? hookInput.toolName ?? 'unknown'
   const toolUseId = hookInput.tool_use_id ?? hookInput.toolUseId ?? null
-  const error = hookInput.tool_error ?? hookInput.error ?? null
+  // This script also serves PostToolUseFailure: Claude Code fires it, not
+  // PostToolUse, when a tool that was allowed to run then fails. A permission
+  // denial returns before the tool runs, so it never fires either hook. Without
+  // this, a failed call was never finalized, and a failed call the user had
+  // approved was left for the sweep.
+  const failed = hookInput.hook_event_name === 'PostToolUseFailure'
+  const error = hookInput.tool_error ?? hookInput.error ?? (failed ? 'Tool call failed' : null)
+  const interrupted = failed && hookInput.is_interrupt === true
   const durationMs = hookInput.duration_ms ?? hookInput.durationMs ?? null
 
   // Governance tools are exempt so a governance call cannot recurse into governing
@@ -115,8 +122,8 @@ async function main() {
   const runState = findRunState(toolName, toolUseId)
   if (!runState?.run_id) process.exit(0)
 
-  // PostToolUse firing for an ask-in-flight means the user clicked "Yes" in
-  // Claude Code's native UI. That answer resolves the gate, so the call's
+  // PostToolUse (or PostToolUseFailure) firing for an ask-in-flight means the
+  // user clicked "Yes" in Claude Code's native UI. That answer resolves the gate, so the call's
   // pending pointer is spent: left behind, the next identical call would
   // present the guard's still-pending approval id, and the guard denies an
   // unresolved approval (`Approval not approved (status=pending)`). Dropped
@@ -140,11 +147,13 @@ async function main() {
 
   const outcome = error ? 'blocked' : 'allowed'
   const result = { outcome }
+  // `ok: false` is what the guard reads as "the action failed" on its receipt.
+  if (error) result.ok = false
   // The answer the user gave, stated rather than inferred: the deny path
   // already reports `approval: 'denied'` through this same endpoint.
   if (nativelyApproved) result.approval = 'approved'
   if (typeof durationMs === 'number') result.duration_ms = durationMs
-  if (error) result.error = String(error).slice(0, 2000)
+  if (error) result.error = `${interrupted ? '[interrupted] ' : ''}${String(error)}`.slice(0, 2000)
 
   try {
     await fetch(`http://${guard.host}:${guard.port}/v1/finalize/tool`, {
